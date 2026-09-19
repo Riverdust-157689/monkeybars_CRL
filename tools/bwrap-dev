@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# bwrap wrapper that SHARES the host /dev instead of building a minimal one.
+#
+# Why: DSH's local sandbox always passes `--dev /dev`, which creates a fresh
+# minimal devtmpfs containing only null/zero/random/tty/... — so /dev/nvidia*
+# does not exist and CUDA fails with CUDA_ERROR_NO_DEVICE inside the sandbox.
+# `--dev-bind /dev /dev` bind-mounts the existing device tree instead, so the
+# NVIDIA nodes (and DRM/EGL nodes for offscreen rendering) are visible.
+#
+# Install (operator side, outside the sandbox):
+#   1. copy/link this file to e.g. ~/bin/bwrap-dev and chmod +x it
+#   2. add to ~/.dsh/profiles/<profile>/cordis.patch.yml:
+#        - id: sandbox
+#          config:
+#            runnerCommand:
+#              - /home/<you>/bin/bwrap-dev
+#            runnerFailureSignatures:
+#              - 'bwrap: '
+#   3. start a NEW session (or restart dsh), then verify:
+#        ls -la /dev/nvidia* ; nvidia-smi
+#        .venv-warp/bin/python -c "import jax; print(jax.devices())"
+#
+# Debug the rewrite without executing bwrap:
+#   BWRAP_DEV_DRY=1 ./tools/bwrap-dev --ro-bind / / --dev /dev -- true
+set -euo pipefail
+
+out=()
+while (($#)); do
+    # `--dev /dev` -> `--dev-bind /dev /dev` (bwrap needs 3 argv entries)
+    if [[ "$1" == "--dev" && "${2:-}" == "/dev" ]]; then
+        out+=(--dev-bind /dev /dev)
+        shift 2
+    else
+        out+=("$1")
+        shift
+    fi
+done
+
+if [[ -n "${BWRAP_DEV_DRY:-}" ]]; then
+    printf '%s\n' "${out[@]}"
+    exit 0
+fi
+
+exec bwrap "${out[@]}"

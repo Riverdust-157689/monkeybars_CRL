@@ -1,0 +1,128 @@
+diff --git a/jaxgcrl/agents/crl/crl.py b/jaxgcrl/agents/crl/crl.py
+index 6cc7996..d1a5e88 100644
+--- a/jaxgcrl/agents/crl/crl.py
++++ b/jaxgcrl/agents/crl/crl.py
+@@ -145,6 +145,21 @@ class CRL:
+ 
+     disable_entropy_actor: bool = False
+ 
++    # target entropy = -entropy_param * action_size (upstream hardcodes 0.5).  With
++    # q_des = key + scale * a, a bigger action window means the same action-space
++    # noise produces proportionally bigger JOINT-space noise, so this is the knob to
++    # hold the physical exploration constant when the window grows:
++    #   sigma_a_reach / sigma_a_m1 = sqrt(sum(scale_reach^2) / sum(scale_m1^2)) = 5.62
++    #   -> d(target) = n_dims * log(1/5.62) = -24  =>  entropy_param ~ 2.2
++    entropy_param: float = 0.5
++
++    # Temporal structure of the exploration noise: hold ONE perturbation for
++    # `expl_hold` control steps instead of drawing an independent one every step.
++    # At 50 Hz i.i.d. noise averages out over ~20 ms, while a swing needs 0.1-0.5 s
++    # of consistent action; holding it gives the random exploration a usable time
++    # correlation without telling the policy where to go.  1 = upstream behaviour.
++    expl_hold: int = 1
++
+     max_replay_size: int = 10000
+     min_replay_size: int = 1000
+     unroll_length: int = 62
+@@ -288,7 +303,7 @@ class CRL:
+         )
+ 
+         # Entropy coefficient
+-        target_entropy = -0.5 * action_size
++        target_entropy = -self.entropy_param * action_size
+         log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
+         alpha_state = TrainState.create(
+             apply_fn=None,
+@@ -371,20 +386,27 @@ class CRL:
+ 
+         @jax.jit
+         def get_experience(actor_state, env_state, buffer_state, key):
++            base_key = key          # fixed per unroll: held-noise blocks fold into it
++
+             @jax.jit
+-            def f(carry, unused_t):
++            def f(carry, t):
+                 env_state, current_key = carry
+                 current_key, next_key = jax.random.split(current_key)
++                if self.expl_hold > 1:
++                    noise_key = jax.random.fold_in(base_key, t // self.expl_hold)
++                else:
++                    noise_key = current_key
+                 env_state, transition = actor_step(
+                     actor_state,
+                     train_env,
+                     env_state,
+-                    current_key,
++                    noise_key,
+                     extra_fields=("truncation", "traj_id"),
+                 )
+                 return (env_state, next_key), transition
+ 
+-            (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
++            (env_state, _), data = jax.lax.scan(
++                f, (env_state, key), jnp.arange(self.unroll_length))
+ 
+             buffer_state = replay_buffer.insert(buffer_state, data)
+             return env_state, buffer_state
+@@ -603,7 +625,23 @@ class CRL:
+                 save_params(path, params)
+ 
+         total_steps = current_step
+-        assert total_steps >= config.total_env_steps
++        # Upstream asserts ``total_steps >= config.total_env_steps``, but the loop
++        # only runs whole epochs of ``num_envs * unroll_length`` and floors the
++        # epoch count, so a request that is not an exact multiple lands short and
++        # crashes the run *after* all the training is done.  Warn instead.
++        if total_steps < config.total_env_steps:
++            logging.warning(
++                "total steps %s < requested %s (rounded down to whole epochs)",
++                total_steps, config.total_env_steps)
++
++        # ``params`` is only assigned inside the checkpoint branch upstream, so a
++        # run without ``checkpoint_logdir`` dies at the return below with
++        # UnboundLocalError.  Always export the final parameters.
++        params = (
++            training_state.alpha_state.params,
++            training_state.actor_state.params,
++            training_state.critic_state.params,
++        )
+ 
+         logging.info("total steps: %s", total_steps)
+ 
+diff --git a/jaxgcrl/utils/evaluator.py b/jaxgcrl/utils/evaluator.py
+index 1ff4a94..14d5c70 100644
+--- a/jaxgcrl/utils/evaluator.py
++++ b/jaxgcrl/utils/evaluator.py
+@@ -133,7 +133,32 @@ class ActorEvaluator:
+                         "success_easy",
+                         "dist",
+                         "distance_from_origin",
++                        # brachiation-specific; skipped automatically when absent
++                        "max_bar",
++                        "dwell_success",
++                        "hand_switches",
++                        "forward",
++                        "bar_L",
++                        "bar_R",
++                        "fell",
++                        # M3.1 coverage / true-extrema diagnostics (see the env's
++                        # _coverage docstring: these SUM to interpretable quantities)
++                        "cov_cross_b1_050",
++                        "cov_cross_b1_030",
++                        "cov_cross_b1_020",
++                        "cov_cross_b1_010",
++                        "cov_min_d_b1_improve",
++                        "cov_swing_improve",
++                        "cov_fwd_improve",
++                        "cov_speed_improve",
++                        "cov_hand_on_steps",
++                        "cov_both_on_steps",
++                        "cov_both_runmax_improve",
++                        "cov_b1_runmax_improve",
++                        "cov_xfer_runmax_improve",
++                        "cov_air_runmax_improve",
+                     ]
++                    if name in eval_metrics.episode_metrics
+                 }
+             )
+ 

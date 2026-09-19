@@ -1,0 +1,41 @@
+{
+  "grip": "forward",
+  "bar_xy": [
+    0.07063154569251752,
+    1.48574143504193
+  ],
+  "dx": -5.2735593669694936e-15,
+  "total_mass": 34.394235200000004,
+  "pose_kwargs": {
+    "grip": "forward",
+    "hip_pitch": -0.8222628721962792
+  },
+  "params": {
+    "grip": "forward",
+    "grip_torque_scale": 10.0,
+    "bar_radius": 0.025,
+    "cage_offset": [
+      0.03,
+      -0.036
+    ],
+    "bar_half_length": 0.45,
+    "bar_friction": 1.4,
+    "bar_condim": 4,
+    "n_bars": 5,
+    "spacing": 0.4,
+    "lock_wrists": true,
+    "sparse_collision": false,
+    "hand_kp": 0.0,
+    "hand_kv": 1.5,
+    "timestep": 0.002,
+    "close_frac": 0.95,
+    "close_time": 0.5,
+    "gravity_free_time": 0.7,
+    "gravity_ramp_time": 1.5,
+    "settle_time": 0.6,
+    "keyframe": true,
+    "mjx_compat": true,
+    "mjx_keep_mesh": [],
+    "mjx_strip_visual": true
+  }
+}

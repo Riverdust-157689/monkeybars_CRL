@@ -1,0 +1,29 @@
+# Python
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+
+# Third-party checkouts (re-fetch with the command in docs/M0_M1_报告.md).
+# Our modifications to jaxgcrl are versioned as patches/jaxgcrl_crl_losses.patch
+# -- regenerate + verify with tools/make_patch.sh after every change there.
+third_party/
+.third_party/
+
+# Upstream Unitree G1 meshes (38 MB); the generated scene XML/JSON we DO version
+# live next to them and only reference this directory.
+assets/g1_brachiation/menagerie/
+
+# Reference PDFs (static, 37 MB)
+ref papers/
+
+# Run artefacts (checkpoints, progress.csv, renders).  Version the *code* with git
+# and pin every run to a commit via the `git_commit` field of args.json / the ckpt
+# config, so a result can always be traced back to the exact source tree.
+runs/
+.scratch/
+
+# Warp kernel cache (regenerated on demand)
+.warp-cache/
+.venv-warp/
+.venv-rl/
