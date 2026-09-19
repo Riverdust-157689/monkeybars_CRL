@@ -129,16 +129,6 @@ GOAL_VARIANTS = ("full", "support", "support_hold", "position", "cross", "cross3
 # is hanging there.  Set equal to the env's own dwell_steps (0.5 s).
 K_SUSTAIN = 25
 
-# Kernel width for the *contact with the next bar* entries of the `advance` goal.
-# Chosen so that the soft contact is exactly 0.5 at the env's own grasp criterion
-# (d = GRASP_THRESH = 5 cm): tau = 0.05 / sqrt(ln 2) = 0.0601.  The generic
-# TAU_CONTACT = 0.04 puts the 0.5 point at 3.3 cm -- *inside* the envelope -- so a
-# settled hang (the grasp point drifts out to 3-4.5 cm, see HOLD_TAU) would read
-# only ~0.55 and the goal would be unreachable by construction.  Only the advance
-# entries use this; every older variant keeps TAU_CONTACT so run #7-#11 stay
-# comparable.
-TAU_NEXT = GRASP_THRESH / float(np.sqrt(np.log(2.0)))
-
 
 # "support" and "support_hold" share the max(c_L, c_R) state slot; "support_hold"
 # adds one more goal dimension, the *sustained-contact* feature (see HOLD_TAU).
@@ -607,7 +597,7 @@ class Brachiation(Env):
                                # instruction goal: "arrive at the next bar and stay"
                                # (progress = 0, i.e. do not ask for the *next* advance;
                                # the relabelled training goals carry the real progress)
-                               [dx_goal, 0.0, 1.0, 1.0, 1.0, 0.0, margin]]).astype(np.float32)
+                               [dx_goal, 0.0, 0.0, 0.0, 1.0, 0.0, margin]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -657,7 +647,7 @@ class Brachiation(Env):
         return jnp.clip(1.0 - jnp.max(load), 0.0, 1.0)
 
     def _advance_features(self, data, kref, hold_next=0.0, progress=0.0) -> jnp.ndarray:
-        """[dx, dz, c_L,next, c_R,next, hold_next, margin] relative to bar k_ref+1.
+        """[dx, dz, d_L,next, d_R,next, hold_next, progress, margin] vs bar k_ref+1.
 
         Translation invariant (dx/dz are differences) and progress invariant (the
         reference bar travels with the robot), so one goal covers every bar.
@@ -674,8 +664,17 @@ class Brachiation(Env):
         x_bar = jnp.take(self.bar_x, k)
         dx = data.qpos[0] - x_bar
         dz = data.qpos[2] - self.key_qpos[2]
-        c_next = jnp.exp(-(d[:, k] / TAU_NEXT) ** 2)
-        return jnp.concatenate([dx[None], dz[None], c_next,
+        # Per-hand DISTANCE to the next bar (metres), not the saturating soft
+        # contact: as run #12 showed, a translation-invariant goal whose only
+        # task-relevant entries are constants-until-contact gives the actor no
+        # direction to move in (the goal is (nearly) equal to the present state for
+        # a stably hanging robot -> the contrastive task degenerates, acc 0.04-0.10,
+        # and the policy just hangs on its start bar).  A distance decreases
+        # monotonically as a hand reaches out, so it restores both the gradient and
+        # the "reach with one hand first" precursor, while staying translation
+        # invariant (bar-independent).
+        d_next = d[:, k]
+        return jnp.concatenate([dx[None], dz[None], d_next,
                                 jnp.asarray(hold_next)[None],
                                 jnp.asarray(progress)[None], self._margin(data)[None]])
 
@@ -712,6 +711,7 @@ class Brachiation(Env):
                           jax.random.uniform(rng_leg, (self.njoints,), minval=-nl, maxval=nl),
                           jax.random.uniform(rng_arm, (self.njoints,), minval=-na, maxval=na))
         qpos = qpos.at[:3].add(root).at[7:].add(noise)
+        k0 = jnp.zeros(())          # bar the episode starts on (0 unless randomised)
         if self.start_bar_max > 0:
             # The bars are periodic, so "start on bar k" is just a translation of the
             # whole robot by k * spacing -- bit-identical physics, no new asset.
