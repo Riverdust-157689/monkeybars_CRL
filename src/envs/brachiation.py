@@ -408,6 +408,11 @@ class Brachiation(Env):
         if self.goal_ahead and self.goal_bar is not None:
             raise ValueError("goal_ahead requires a sampled goal bar "
                              "(train.py: --train-goal-bar -1)")
+        if self.goal_ahead and self.start_bar_max > self.n_bars - 2:
+            # starting on the last bar leaves no bar ahead -> the goal would equal
+            # the start (a trivially satisfied episode)
+            raise ValueError(f"goal_ahead needs start_bar_max <= n_bars-2 "
+                             f"({self.n_bars - 2}), got {self.start_bar_max}")
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -740,11 +745,16 @@ class Brachiation(Env):
                           jax.random.uniform(rng_leg, (self.njoints,), minval=-nl, maxval=nl),
                           jax.random.uniform(rng_arm, (self.njoints,), minval=-na, maxval=na))
         qpos = qpos.at[:3].add(root).at[7:].add(noise)
+        # NB: `k0` and the sampled goal bar must come from DIFFERENT keys.  Reusing
+        # `rng_goal` for both makes them strongly correlated (the same uniform bits
+        # decide both draws), which in practice pinned gk to k0+1 -- i.e. the "goal is
+        # any later bar" distribution silently collapsed to "exactly the next bar".
+        rng_bar, rng_goal_sel = jax.random.split(rng_goal)
         k0 = jnp.zeros(())          # bar the episode starts on (0 unless randomised)
         if self.start_bar_max > 0:
             # The bars are periodic, so "start on bar k" is just a translation of the
             # whole robot by k * spacing -- bit-identical physics, no new asset.
-            k0 = jax.random.randint(rng_goal, (), 0, self.start_bar_max + 1).astype(jnp.float32)
+            k0 = jax.random.randint(rng_bar, (), 0, self.start_bar_max + 1).astype(jnp.float32)
             qpos = qpos.at[0].add(k0 * self.bar_spacing)
         qvel = nv * jax.random.normal(rng_vel, (self.mj_model.nv,))
 
@@ -761,7 +771,7 @@ class Brachiation(Env):
                 # "start anywhere in the first N-1 bars, the goal is any later bar")
                 k0i = k0.astype(jnp.int32)
                 span = jnp.maximum(self.n_bars - 1 - k0i, 1)
-                gk = jnp.minimum(k0i + 1 + jax.random.randint(rng_goal, (), 0, span),
+                gk = jnp.minimum(k0i + 1 + jax.random.randint(rng_goal_sel, (), 0, span),
                                  self.n_bars - 1)
             else:
                 gk = jax.random.randint(rng_goal, (), self.goal_bar_min, self.n_bars)
