@@ -102,7 +102,6 @@ class FeatureLayout(NamedTuple):
     prev_action: slice
     advance: slice         # M4: [dx, dz, c_L,next, c_R,next] relative to bar k_ref+1
     kref: slice            # M4: k_ref / (n_bars - 1)   (state only, NOT a goal entry)
-    margin: slice          # M4: 1 - max_j |qfrc_bias_j| / tau_max_j
     state_dim: int
     goal_indices: Tuple[int, ...]
 
@@ -211,11 +210,10 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
     cross = nxt(8) if goal_variant in CROSS_FAMILY else slice(i, i)
     prev_action = nxt(14)
-    # M4 "advance" block: the four relative dims are goal entries AND therefore must
-    # live in the state, plus k_ref (context for the critic) and the torque margin.
+    # M4 "advance" block: its six dims are goal entries AND therefore must live in
+    # the state, plus k_ref (context for the critic, NOT a goal entry).
     advance = nxt(6) if goal_variant == "advance" else slice(i, i)
     kref = nxt(1) if goal_variant == "advance" else slice(i, i)
-    margin = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
                     *(range(hand_pos.start, hand_pos.start + 6)))
     if goal_variant == "full":
@@ -230,12 +228,12 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         pick = {"cross": (0, 1, 2, 4, 5), "cross3": (3, 4, 5), "hold2": (6, 4)}[goal_variant]
         goal_indices = tuple(cross.start + k for k in pick)
     elif goal_variant == "advance":
-        # goal = [dx, dz, c_L,next, c_R,next, hold_next] + the torque margin
+        # goal = [dx, dz, d_L,next, d_R,next, hold_next, progress]
         # (k_ref stays context: it is progress, not a target)
-        goal_indices = tuple(advance.start + k for k in range(6)) + (margin.start,)
+        goal_indices = tuple(advance.start + k for k in range(6))
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
-                         grasp_support, hold, cross, prev_action, advance, kref, margin,
+                         grasp_support, hold, cross, prev_action, advance, kref,
                          i, tuple(goal_indices))
 
 
@@ -307,9 +305,9 @@ class Brachiation(Env):
              "cross": [11, 12, 13, 15, 16],
              "cross3": [14, 15, 16],
              "hold2": [17, 15],
-             # M4 superset tail: [.., hold(19), dx, dz, c_Lnext, c_Rnext,
-             #                    hold_next, progress, margin]
-             "advance": [20, 21, 22, 23, 24, 25, 26]}[self.goal_variant],
+             # M4 superset tail: [.., hold(19), dx, dz, d_Lnext, d_Rnext,
+             #                    hold_next, progress]
+             "advance": [20, 21, 22, 23, 24, 25]}[self.goal_variant],
             dtype=jnp.int32)
         self.goal_size = int(len(self.goal_indices))
         self.goal_reach_thresh = goal_reach_thresh
@@ -327,15 +325,6 @@ class Brachiation(Env):
         self.act_scale = jnp.array(ACTION_WINDOWS[action_window], dtype=jnp.float32)
         self.hand_act = {s: jnp.array([aid(f"{s}_hand_{j}_joint") for j in FINGER_JOINTS], dtype=jnp.int32)
                          for s in ("left", "right")}
-        # M4 torque margin: the DOFs and force limits of the 12 action joints
-        # (arm + waist).  `qfrc_bias` is the gravity/Coriolis load that the
-        # actuators must carry, so 1 - |qfrc_bias|/limit is "how much actuator
-        # headroom this pose leaves" -- the CRL-language version of "battery".
-        arm_jnt = np.array([m.actuator_trnid[int(a), 0] for a in self.act_armwaist])
-        self.margin_dof = jnp.array(m.jnt_dofadr[arm_jnt], dtype=jnp.int32)
-        # NB: the G1's position actuators have forcelimited=False and forcerange=(0,0);
-        # the real limits are the *joint* actuator-force ranges.
-        self.margin_lim = jnp.array(m.jnt_actfrcrange[arm_jnt, 1], dtype=jnp.float32)
         self.wrist_body = {s: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"{s}_wrist_roll_link")
                            for s in ("left", "right")}
         # --- keyframe --------------------------------------------------------
@@ -385,7 +374,7 @@ class Brachiation(Env):
             }[self.goal_variant]], dtype=jnp.float32)
         elif self.goal_variant == "advance":
             # ONE bar-independent goal: "hanging under the next bar with both hands,
-            # relaxed".  [dx, dz, c_Lnext, c_Rnext, margin] -- relative, so it is the
+            # relaxed".  [dx, dz, d_Lnext, d_Rnext, hold_next, progress] -- relative,
             # same vector for every bar; `keep` selects exactly those entries.
             self.goal_set = jnp.array([goal0[keep]], dtype=jnp.float32)
         else:
@@ -586,10 +575,8 @@ class Brachiation(Env):
         # M4 tail = the GOAL vector, i.e. what `_advance_features` reads at the
         # *target* state ("hanging under the next bar, and staying there").  There
         # dx = qpos[0] - bar_x[next] equals the keyframe's offset from ITS bar (the
-        # hang pose is the same at every bar), both contacts are 1, dz is 0 and the
-        # sustained-contact entry is 1 (a settled hang).
-        margin = 1.0 - float(np.max(np.abs(np.asarray(kd.qfrc_bias)[np.asarray(self.margin_dof)])
-                                     / np.asarray(self.margin_lim)))
+        # hang pose is the same at every bar), both hand-to-next-bar distances are 0,
+        # dz is 0 and the sustained-contact entry is 1 (a settled hang).
         dx_goal = float(kd.qpos[0]) - float(self.bar_x[0])
         return np.concatenate([[kd.qpos[0], kd.qpos[2]], np.concatenate(p),
                                [c, c, c], rel, [dd, cont(dd), cont(dl0), cont(dl1),
@@ -597,7 +584,7 @@ class Brachiation(Env):
                                # instruction goal: "arrive at the next bar and stay"
                                # (progress = 0, i.e. do not ask for the *next* advance;
                                # the relabelled training goals carry the real progress)
-                               [dx_goal, 0.0, 0.0, 0.0, 1.0, 0.0, margin]]).astype(np.float32)
+                               [dx_goal, 0.0, 0.0, 0.0, 1.0, 0.0]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -641,13 +628,8 @@ class Brachiation(Env):
         """Consecutive gripping steps -> the sustained-contact goal entry."""
         return 1.0 - jnp.exp(-jnp.asarray(streak) / HOLD_TAU)
 
-    def _margin(self, data) -> jnp.ndarray:
-        """Actuator headroom of the 12 arm/waist joints: 1 - max|qfrc_bias|/limit."""
-        load = jnp.abs(data.qfrc_bias[self.margin_dof]) / self.margin_lim
-        return jnp.clip(1.0 - jnp.max(load), 0.0, 1.0)
-
     def _advance_features(self, data, kref, hold_next=0.0, progress=0.0) -> jnp.ndarray:
-        """[dx, dz, d_L,next, d_R,next, hold_next, progress, margin] vs bar k_ref+1.
+        """[dx, dz, d_L,next, d_R,next, hold_next, progress] vs bar k_ref+1.
 
         Translation invariant (dx/dz are differences) and progress invariant (the
         reference bar travels with the robot), so one goal covers every bar.
@@ -676,7 +658,7 @@ class Brachiation(Env):
         d_next = d[:, k]
         return jnp.concatenate([dx[None], dz[None], d_next,
                                 jnp.asarray(hold_next)[None],
-                                jnp.asarray(progress)[None], self._margin(data)[None]])
+                                jnp.asarray(progress)[None]])
 
     def episode_info_zero(self):
         """Reset values of the episode-scoped `info` entries at t=0.
