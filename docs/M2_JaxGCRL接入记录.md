@@ -2244,3 +2244,28 @@ $$\text{actual} = \Big\lfloor\tfrac{\text{steps}-128000}{\text{num\_evals}\cdot 
 | `len` / `fell` | 保持 474–501 / ≤6% | 别用 `success`（受 `c_sup` 常数拖累）|
 
 若 6 h 后 `cov_dual_on_steps/len` 仍 <0.7 且 `bar_R` 仍回 B0 ⇒ 上 9.41.4 的第 1 条（起手双持 reset），再不行才动第 3 条（每手接触+每手 hold）。
+
+## 9.42 `--start-bar-max` + `--goal-ahead`：真正实现"初始在前 N−1 根任意一根、目标在它后面的任意一根"
+
+**澄清（用户提问）**：`--train-goal-bar -1 --train-goal-bar-min 0` **没有**这个语义——start 恒为 B0（`--start-bar-max` 默认 0），而 goal 是 `gk ~ U[goal_bar_min, n_bars)` 的**独立**采样，与起始杆无关（所以 1/5 的 episode 目标就是它正踩着的那根；一旦放开 start 还可能采到身后）。而且 `--start-bar-max` 当时只允许 `advance`，配 `support_dual` 会直接报错。
+
+**本轮改动**：
+
+1. 放开限制：`start_bar_max > 0` 现在对**任何 goal_set 按杆给出的变体**都合法（目标坐标是绝对量，无论从哪根杆出发都正确）；唯一不允许的组合是"随机起点 + 固定目标杆"（会把目标放到身后）。
+2. 新增 `--goal-ahead 1`：`gk = min(k0 + 1 + U{0, …, n−1−k0}, n−1)` ⇒ **目标恒在起始杆之后**（要求目标杆是采样的，即 `--train-goal-bar -1`）。
+3. **CPU 验证**：`start_bar_max=3, goal_ahead=1`，12 个环境 → `k0 ∈ {0,1,2,3}`、`gk ∈ {1..4}`、**全部 `gk > k0`** ✓
+
+**命令（真正的多杆设定）**：
+
+```bash
+.venv-warp/bin/python src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant support_dual \
+  --train-goal-bar -1 --goal-ahead 1 --start-bar-max 3 --eval-goal-bar -1 \
+  --expl-hold 10 --num-evals 20 --steps 12200000 \
+  --checkpoint-dir runs/ckpt_dual_goal --save-every 5 \
+  --impl warp --scene full035 --wandb --exp-name brach_dual_goal
+```
+
+- `--start-bar-max 3` = 起始杆 ∈ {B0..B3}（前 N−1 = 4 根）；`--goal-ahead 1` = 目标 ∈ {k0+1..B4}；`--train-goal-bar-min` 此时无意义（下界由 k0 决定）。
+- `--eval-goal-bar -1`（**不再钉 B1**）：评估环境与训练同分布（随机起点 + 朝前的目标），因此 `success`/`dist` **不与 run #13 可比**，这一枪的头条是 **`advance_max`**（推进杆数）与 `bar_L/bar_R`/`max_bar` 的杆号分布；`cov_dual_*`（双持质量）仍可与 run #13 比。

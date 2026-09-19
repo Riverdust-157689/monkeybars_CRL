@@ -144,6 +144,11 @@ def parse() -> argparse.Namespace:
                          "the robot by k*spacing (bars are periodic, so the physics is "
                          "identical).  Requires --goal-variant advance, whose goal is "
                          "bar-independent.")
+    ap.add_argument("--goal-ahead", type=int, default=0,
+                    help="M4: sample the goal bar strictly AFTER the bar the episode "
+                         "started on (needs a sampled goal bar, e.g. --train-goal-bar -1). "
+                         "Combine with --start-bar-max N-2 to start on any of the first "
+                         "N-1 bars and always aim forward.")
     ap.add_argument("--goal-position-only", type=int, default=0,
                     help="deprecated alias for --goal-variant position")
     ap.add_argument("--discounting", type=float, default=0.995)
@@ -275,6 +280,7 @@ def main() -> int:
                       goal_variant=goal_variant,
                       action_window=args.action_window,
                       start_bar_max=args.start_bar_max,
+                      goal_ahead=bool(args.goal_ahead),
                       njmax=args.njmax,
                       naconmax=max(1024, args.naconmax_per_world * args.num_envs))
     # variants with ONE bar-independent instruction goal (no --train-goal-bar)

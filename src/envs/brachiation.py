@@ -267,6 +267,7 @@ class Brachiation(Env):
         goal_reach_thresh: float = 0.35,
         dwell_steps: int = 25,               # 0.5 s at 50 Hz
         start_bar_max: int = 0,              # M4: reset on bar U{0..start_bar_max}
+        goal_ahead: bool = False,            # M4: sample the goal bar AFTER the start bar
         naconmax: int = 16384,               # contact budget for ALL worlds (see note)
         njmax: int = 512,                    # constraint rows per world
         ls_iterations: Optional[int] = None, # None -> keep the scene XML value (20)
@@ -399,8 +400,14 @@ class Brachiation(Env):
         # "advance" goal: every other variant's goal_set is pinned to absolute bar
         # coordinates, so shifting the start would make it unreachable.
         self.start_bar_max = int(start_bar_max)
-        if self.start_bar_max > 0 and self.goal_variant != "advance":
-            raise ValueError("start_bar_max > 0 requires goal_variant='advance'")
+        # `start_bar_max` shifts the whole robot by k0 bars.  That is fine for any
+        # variant whose goal_set covers the bars (the goal coordinates for bar gk are
+        # absolute and correct whatever bar the episode starts on); what must not
+        # happen is a goal bar *behind* the start, which is why `goal_ahead` exists.
+        self.goal_ahead = bool(goal_ahead)
+        if self.goal_ahead and self.goal_bar is not None:
+            raise ValueError("goal_ahead requires a sampled goal bar "
+                             "(train.py: --train-goal-bar -1)")
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -749,7 +756,15 @@ class Brachiation(Env):
         if self.goal_variant in CROSS_FAMILY:
             gk = jnp.asarray(0)          # single fixed goal (see goal_set above)
         elif self.goal_bar is None:
-            gk = jax.random.randint(rng_goal, (), self.goal_bar_min, self.n_bars)
+            if self.goal_ahead:
+                # goal bar strictly AFTER the bar this episode started on (M4:
+                # "start anywhere in the first N-1 bars, the goal is any later bar")
+                k0i = k0.astype(jnp.int32)
+                span = jnp.maximum(self.n_bars - 1 - k0i, 1)
+                gk = jnp.minimum(k0i + 1 + jax.random.randint(rng_goal, (), 0, span),
+                                 self.n_bars - 1)
+            else:
+                gk = jax.random.randint(rng_goal, (), self.goal_bar_min, self.n_bars)
         else:
             gk = jnp.asarray(self.goal_bar)
         goal = self.goal_set[gk]
