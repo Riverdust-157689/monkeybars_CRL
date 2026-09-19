@@ -2176,3 +2176,71 @@ $$g=\big[\underbrace{x,z,p_L(3),p_R(3)}_{\text{绝对位置（8）}},\;\underbra
 | `dist`（**别看 `success`**，见 9.40.1）| 从 ~0.78 往下 | 不动 |
 
 若 $S_{\rm dual}$ 长期卡 2–3 且右手每次到杆后**物理滑脱** ⇒ 按文档的判据：问题已不在 goal，而在**抓握动力学 / action representation / 接触控制**，那时再转向那条线（M3.0 的接触/抓手分析、指力、`expl_hold` 尺度）。
+
+## 9.41 run #13 复盘：指标说"双持 46%"，视频却是"单手挂 B1 + 另一只手回够 B0"
+
+### 9.41.1 事实（`runs/render/dual_final/`，3 集 × 401 步，确定性策略）
+
+每只手的"最近杆号"分布（步数）：
+
+| 集 | 左手 | 右手 | 双持所在杆 |
+|---|---|---|---|
+| 0 | B1: **337**（离杆 58, B0 6）| B1: **162**（离杆 231, **B0 8**）| B1 162 / B0 6 |
+| 1 | B1: **322**（离杆 73, B0 6）| B1: **78**（离杆 314, **B0 9**）| B1 78 / B0 6 |
+| 2 | B1: **350**（离杆 45, B0 6）| B1: **147**（离杆 245, **B0 9**）| B1 147 / B0 6 |
+
+时间历程（ep1）：左手从换手完成后一直挂 B1；右手大部分时间是 `-1`（离杆），`dist` 常驻 1.1–1.7；只在 step 320 与 400 才回到 B1（`dist` 0.27 / 0.095）。
+
+⇒ **"单手挂 B1、另一只手偶尔真的回到 B0"是真实行为**（每集都有 8–9 步 `bar_R=0`），不是渲染问题。
+
+### 9.41.2 为什么 eval 指标看起来不错（三条，都不矛盾）
+
+1. `cov_dual_*` 是 **16 个 eval env 的逐步平均**；这 3 集恰好偏弱（`cov_dual_on_steps`：eval 219.9 vs 回放 162/78/147，`dist/len`：0.83 vs 1.2–1.7）。
+2. **双持"成段但不维持"**：最长段 53–62 步（eval max 69.8 ✓），基本发生在**刚落上 B1 之后**；随后右手松开摆回，隔一阵再搭回来。所以 `dual_on_steps/len = 46%` 只能读作"**存在双持段**"，不能读作"**一直双持**"。
+3. 指标测的确实是 B1（`dual_on_bar` 绝大部分是 1，不是 0）⇒ 指标没坏，是**比例给人的印象**有偏差。
+
+### 9.41.3 机制：这是"过渡进行到一半"，不是学不会
+
+- goal **确实在推**右手回来：单手 `dist≈1.2` vs 双手 `≈0.1`（差 ~1.1，主要来自 `h_dual`）。
+- 但 CRL 训练目标是**策略自己未来帧**的重标记目标；当前多数未来帧是"单手挂 B1 + 右手乱摆" ⇒ goal 分布多数仍要求该姿态 ⇒ run #11 的侧吸引子**被削弱但没消失**。
+- 正向反馈**正在起效且没有平台**：`S_dual` 5→24→37→56.5→**69.8**；`dual_on_steps` 7.6→**219.9**；`single_on_steps` 493→**209**；`len` 501、`fell` 0–6%。
+
+### 9.41.4 可选的杠杆（按性价比）
+
+1. **让一部分 episode 起手就处于"双手挂目标杆"**（放开 `--start-bar-max` 的"仅 advance"限制 + 目标杆采样）⇒ dual 姿态立刻进入 replay，正反馈提前闭合（M3.4 的 M4 版）。
+2. **同配方跑更久**（本次采用 6 h）。
+3. **拉开单手/双手差距**：`max(c_L,c_R)` → 每只手各自的 `c_L,c_R`，并加两个**每只手**的 hold（`h_L,h_R`，不含杆号信息，仍不是文档反对的 10 维向量）⇒ 单手要多付 ~2–3 而非 1.0。注意这只改**权重**，不改"目标来自自身未来"的机制。
+4. 多杆（goal-bar 采样）押后：**下一跳的发射状态就是"双手稳定挂住"**，现在每集只有 20–40% 时间真正双持。
+
+**读数纠正**：`c_sup = max(c_L,c_R)` 的目标 1.0 在稳定悬挂时不可达（实测 ~0.55），它在单手/双手两种状态下是**同一个 ~0.2 的常数** ⇒ 删它只让 `dist`/`success` 变好看，**不改变单/双手差距**（差距 0.7 全在 `h_dual`）。
+
+### 9.41.5 run #14：同配方 6 h（本次采用）
+
+`--steps` / `--num-evals` 的换算（实测吞吐 8.387 M env-steps/h；prefill = ceil(1000/62)=17 unrolls = 134,912 步）：
+
+$$\text{actual} = \Big\lfloor\tfrac{\text{steps}-128000}{\text{num\_evals}\cdot 128\cdot 62}\Big\rfloor \cdot \text{num\_evals}\cdot 7936 + 134912$$
+
+本仓校准：`12.2M/20evals → 12,197,632 (1.45 h)`、`33.46M/40evals → 33,466,112 (3.99 h)`、**`50.3M/60evals → 50,131,712 (5.98 h)`** ✓
+
+```bash
+.venv-warp/bin/python src/check_args.py && .venv-warp/bin/python src/check_metrics.py
+
+.venv-warp/bin/python src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant support_dual --train-goal-bar 1 --eval-goal-bar 1 \
+  --expl-hold 10 --num-evals 60 --steps 50300000 \
+  --checkpoint-dir runs/ckpt_dual6h --save-every 5 \
+  --impl warp --scene full035 --wandb --exp-name brach_dual_b1_6h
+```
+
+**判据（按重要性）**：
+
+| 读数 | 目标 | 说明 |
+|---|---|---|
+| `cov_dual_on_steps / len` | 从 0.46 → **>0.7** | 真正"一直双持"才算过渡完成 |
+| `cov_dual_runmax_improve` | 70 → **150+** | 单次双持时长（3 s）|
+| `cov_single_on_steps` | 209 → 继续降 | 与上一条互为镜像 |
+| `bar_R` 的"回 B0"现象 | 回放里应消失 | 每集 8–9 步 `bar_R=0` 是当前最刺眼的问题 |
+| `len` / `fell` | 保持 474–501 / ≤6% | 别用 `success`（受 `c_sup` 常数拖累）|
+
+若 6 h 后 `cov_dual_on_steps/len` 仍 <0.7 且 `bar_R` 仍回 B0 ⇒ 上 9.41.4 的第 1 条（起手双持 reset），再不行才动第 3 条（每手接触+每手 hold）。
