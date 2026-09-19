@@ -1868,7 +1868,9 @@ obs 153 ⇒ **与旧 checkpoint 不兼容**（新跑，不能续训）。
 
 ### 9.35.3 `advance` 目标：一根杆的"平移不变"目标（M4 的地基）
 
-$$g=\big[\underbrace{x_{\rm com}-x_{B_{k+1}}}_{\Delta x},\;\underbrace{z_{\rm com}-z_{\rm hang}}_{\Delta z},\;c_{L,B_{k+1}},\;c_{R,B_{k+1}},\;\underbrace{1-e^{-\text{next\_streak}/10}}_{\text{hold\_next}},\;\underbrace{1-\max_j\frac{|q_{{\rm bias},j}|}{\tau_j^{\max}}}_{\text{margin}}\big]\quad(6\ \text{维})$$
+$$g=\big[\underbrace{x_{\rm com}-x_{B_{k+1}}}_{\Delta x},\;\underbrace{z_{\rm com}-z_{\rm hang}}_{\Delta z},\;c_{L,B_{k+1}},\;c_{R,B_{k+1}},\;\underbrace{1-e^{-\text{next\_streak}/10}}_{\text{hold\_next}},\;\underbrace{k_{\rm ref}-k_{\rm start}}_{\text{progress}},\;\underbrace{1-\max_j\frac{|q_{{\rm bias},j}|}{\tau_j^{\max}}}_{\text{margin}}\big]\quad(7\ \text{维})$$
+
+`progress` = 本 episode **已经推进了几根杆**（原始计数，1 根 = 距离尺度上的 1.0，与一个接触项同量级）。加它的原因见 §9.37：goal 完全平移不变时，"稳定吊在 $k$ 号杆"与"再往前一级的稳定吊着"在相对量上**长得一样**，重标记出来的大多数 goal 会被平凡满足 ⇒ 没有东西推着策略继续走。
 
 **`hold_next` 是必需的，不是可选项**（run #11 的教训，见 §9.36）：前四个量都是**瞬时**的，"从下一根杆的悬挂位姿里飞掠而过、两手顺便擦到"就能在几帧内把距离压小——这正是 run #10 的退化解。`hold_next` 只在**手持续留在下一根杆窗内**时才涨，所以目标状态是"**到了而且留下了**"。
 
@@ -1883,12 +1885,12 @@ $$g=\big[\underbrace{x_{\rm com}-x_{B_{k+1}}}_{\Delta x},\;\underbrace{z_{\rm co
 
 | 检查 | 结果 |
 |---|---|
-| 布局 | `state=148 / goal=6 / obs=154`，`goal_indices=(141..145, 147)` |
-| goal_set | 只有一行 = `[−0.071, 0, 1, 1, 1, 0.854]`（相对量，与杆号无关）|
-| 平移不变 | 起点随机在 B0/B1 时初始 `dist` 相同（1.457）✓ |
+| 布局 | `state=149 / goal=7 / obs=156`，`goal_indices=(141..146, 148)` |
+| goal_set | 只有一行 = `[−0.071, 0, 1, 1, 1, **0**, 0.854]`（与杆号无关；`progress=0` = "到达下一根杆并留下"，见 §9.37.3）|
+| 平移不变 | 起点随机在任意杆时初始 `dist` 相同（1.767）✓，且 `k_ref = k_start` = 实际起始杆 ✓ |
 | **到位且留下** | 挪到 B1 悬挂位姿后：`dist` 0.905(1 步) → 0.424(11 步) → **0.336/0.323(21 步) = success** ✓（`dwell_success` 也因此可达）|
 | **推进后重定向** | 持续抓稳 **25 步**（`K_SUSTAIN`）后 `k_ref: 0→1`、`next_streak` 归零、goal 指向 B2、`dist` 回到 1.76 ✓（连续过多杆的自我课程）|
-| 事件级 info 复位 | 用 `brax_ext.wrap` 强制掉落：`max_bar/k_ref/kref_max/cov_b1_runmax` 均回到 0，`cov_min_d_b1` 回到 2.0 ✓ |
+| 事件级 info 复位 | 用 `brax_ext.wrap` 强制掉落：`max_bar/k_ref/cov_b1_runmax` 均回到该 episode 的 t=0 值，`cov_min_d_b1` 回到 2.0 ✓ |
 
 ### 9.35.4 顺带修掉的第二个指标 bug：`info` 里的计数器从不跨 episode 复位
 
@@ -1913,9 +1915,9 @@ brax 的 `AutoResetWrapper` 只换 `pipeline_state`/`obs`，**不碰 `info`** �
 
 | 现象 | 判读 | 下一步 |
 |---|---|---|
-| `kref_max` 停在 0、`len` 掉回 40–70 | 目标偏严（要两只手同时 + 持续 0.5 s），策略退回鱼跃 | 先加 `--entropy-param 1.6` 降噪；或把 `K_SUSTAIN` 降到 10 |
-| `kref_max` = 1 出现、`len` ≥ 200 | 能推进一根杆且稳定（M4.0 达成） | 跑满 4 h 看 $P(\ge 2)$ |
-| `kref_max` ≥ 2 | 已经连续过多杆 | 直接进 M4.3（9 根杆 + lap 统计） |
+| `advance_max` 停在 0、`len` 掉回 40–70 | 目标偏严（要两只手同时 + 持续 0.5 s），策略退回鱼跃 | 先加 `--entropy-param 1.6` 降噪；或把 `K_SUSTAIN` 降到 10 |
+| `advance_max` = 1 出现、`len` ≥ 200 | 能推进一根杆且稳定（M4.0 达成） | 跑满 4 h 看 $P(\ge 2)$ |
+| `advance_max` ≥ 2 | 已经连续过多杆 | 直接进 M4.3（9 根杆 + lap 统计） |
 
 ## 9.36 复盘：run #11 的成功有多少归功于 `hold`？（以及它为什么必须进 M4 的 goal）
 
@@ -1942,3 +1944,37 @@ run #10 已经把"够到"解决（0.006 m）却把 `len` 从 67 掉到 41——*
 1. 只要 goal 里的接触量是**瞬时**的，"飞掠"就会回来 ⇒ M4 必须在 goal 里保留一个**持续量** → `hold_next`（针对**下一根杆**，不是"任意杆"）。
 2. "两只手都要在"必须由**每只手各自的、针对目标杆**的接触项表达（`max` 会抹平）→ `c_{L,B_{k+1}}` 与 `c_{R,B_{k+1}}` 分开。
 3. 合起来就是 `advance` 的 6 维 goal：**"到了下一根杆、两只手都在、并且留下"**；策略侧仍完全不限制（鱼跃、单手摆荡都允许）。
+
+## 9.37 关于 M4 目标的两点澄清（用户提问）——附带两个 bug 修复
+
+### 9.37.1 "goal 总是初始状态的下一根杆，还是可能隔几根？"
+
+**都不是。** goal 永远指向 **`k_ref + 1`**，而 `k_ref` **在 episode 内自己往前走**：
+
+| 时刻 | `k_ref` | goal 指向 |
+|---|---|---|
+| reset | 起始杆 $k_0$（`--start-bar-max` 随机）| $k_0+1$ |
+| 在 $k_0+1$ 上持续抓稳 25 步（`K_SUSTAIN`）| $k_0+1$ | $k_0+2$ |
+| 再一根 | $k_0+2$ | $k_0+3$ |
+| 到最后一根（B4）| 4 | 4（被 clamp）= "停在最后一根" |
+
+所以它不是"从初始状态数一根"，而是"**从你上一次站稳的那根数一根**"。**能跳杆**：`k_ref` 的规则是"任何**比当前 `k_ref` 更靠前**且持续抓稳 25 步的杆号" ⇒ 一次鱼跃直接抓稳 $k_{\rm ref}+3$ 会让 `k_ref` 跳过去（跳过两根，`progress` 一次 +3）。但 **goal 从不指超过一根**。
+
+### 9.37.2 "要跑完所有杆，`1−e^{−next_streak/10}` 是否不合适？或只在最后一根加？"
+
+**每一根都需要，而且不能只放最后一根**：它不是终点条件，而是"**每一次到达都必须是真的留下，而不是擦一下**"（run #10→#11 的 A/B，§9.36）。最后一根不需要特殊处理——`k = min(k_ref+1, n_bars−1)` 的 clamp 会让它自然变成"停在最后一根"。
+
+### 9.37.3 但"走完所有杆"确实需要**额外一维**：`progress`（本轮新加）
+
+完全平移不变的目标有个隐患：**"稳定吊在 $k$ 号杆（看向 $k+1$）"和"推进一级之后的稳定状态"在相对量上逐位相同** ⇒ 轨迹大部分时间在稳定悬挂，重标记出的大多数 goal 被当前状态**平凡满足**（对比任务退化，§9.31.1 的坑），没有东西推着策略继续走。
+
+**修法**：goal 加一维 `progress = k_ref − k_start`（原始计数，1 根 = 1.0）。这样"更靠后的未来状态"在 goal 空间里**明确更远**，而到达它唯一的路就是真的再推进一根杆；它仍然是**相对增量**，单指令目标的形式没被破坏。
+
+**代价（已知并记录）**：instruction goal 的 `progress` 置 **0**（"到达下一根杆并留下"）⇒ `eval/episode_success` 只衡量"每次到达是否稳住"，不衡量走了几根。**M4 的头条量是 `advance_max`**（本 episode 推进的杆数，相对起始杆归一，起点在 B1 不会白得 1 分）。
+
+### 9.37.4 顺带修掉的两个 bug（都是 `--start-bar-max` 引出来的）
+
+1. **`k_ref`/`k_start` 的起点**：原来 reset 后恒为 0，而 `--start-bar-max 1` 让一半环境从 B1 出发 ⇒ 第一个 goal 会指向"它正吊着的那根杆"（甚至身后）。现在 reset 把它们设成**实际起始杆**；新增 `k_start` 供 `progress` 用 ✓（实测：从 B1 出发时 `k_ref=k_start=1`，初始 `dist` 与从 B0 出发时相同 = 1.767）。
+2. **auto-reset 恢复的是"硬零"而不是"该 episode 自己的 t=0 值"**：`MjxAutoResetWrapper` 现在 reset 时存下 episode 级初始 info（`_first_episode_info`），掉落重生时恢复**那些值**——否则从 B1 出发的环境一生就掉回 `k_ref=0`，bug 1 会在每次重生后复发 ✓（实测：掉落重生后 `k_start/k_ref` 仍与各自起始杆一致）。
+
+**指标改名**：`kref_max` → **`advance_max`**（推进的杆数，相对起始杆）。
