@@ -131,7 +131,7 @@ def main() -> int:
                                                  "hold_streak", "k_ref", "k_ref_run",
                                                  "k_ref_run_bar", "kref_max",
                                                  "next_streak", "k_start",
-                                                 "advance_max")):
+                                                 "advance_max", "dual_streak")):
             problems.append(f"info[{k!r}] read but not in _cov_zero_info")
 
     print(f"metrics emitted by _coverage : {len(emitted)}")

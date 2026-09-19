@@ -2098,3 +2098,81 @@ run #10 已经把"够到"解决（0.006 m）却把 `len` 从 67 掉到 41——*
 1. `dist/len` 降到 ~0.5 但 `advance_max` = 0 ⇒ "伸手"学会了、"抓住"没有 ⇒ **M3.4 近目标 reset**（起始就让一只手搭在下一根杆上）把抓住那段直接喂进 replay。
 2. 全部指标都不动 ⇒ 检查探索尺度（`--entropy-param 1.6` / `--expl-hold 20`）。
 3. 能推进但不稳 ⇒ 调 `K_SUSTAIN`（门限长度就是"留下"的压力强度）、`n_bars` 扩到 9、`γ` 0.995→0.997。
+
+## 9.40 采用用户 M4 文档的方案：`support_dual`（run #11 只加一维 `h_dual`）
+
+依据：`docs/M4_对与#11的分析和goal的设计问题的讨论.md`（用户撰写）。**结论：同意，并已实现。**
+
+### 9.40.1 我对该文档的评估
+
+**同意的部分（逐条 + 我补的证据）**
+
+| 文档观点 | 我的评估 |
+|---|---|
+| 不要替换 run #11 的全局 `h_any`，它是被实验验证的机制 | ✓ 同意。`h_any` 把"飞掠"从 `dist≈0.06` 推到 `≈1`，这是 run #10→#11 的主因 |
+| 只加**一维** `h_dual = 1-e^{-S_dual/10}`，`S_dual` = "两只手同时在同一根杆 5 cm 窗内"的连续步数 | ✓ 已实现（`support_dual`）。这是修"单手侧吸引子"的**最小改动** |
+| 不要上"每只手×每根杆"的 10 维 streak | ✓ 同意：与绝对 `p_L,p_R` 重复，且维度随 $n_{\rm bars}$ 增长 |
+| 不要用 `min(c_L,c_R)` | ✓ 同意：仍然瞬时；run #11 ep0 step21 就已经 `c_L=c_R=1`，加它等于重演 run #10 |
+| 两条 streak 都用 **5 cm** 判据（不是 `max(c)>0.5` 的 3.3 cm） | ✓ 同意（实测稳定悬挂会漂到 3–4.5 cm，3.3 cm 会让 streak 闪烁归零）|
+| 第一枪 `/10` 不要改，保持"只加一维"的干净 A/B | ✓ 同意（run #13 = run #11 + `h_dual`）|
+| `h_any`/`h_dual` 也必须进 **state**（否则是 POMDP，会污染 critic）| ✓ 同意，**而且代码里已经如此**：goal 必须是 state 的切片，所以 `support_hold` 的 `h_any` 本来就在 state 里（state 143 / obs 153）；新变体把 `h_dual` 也放进 state（144 / 155）|
+| 指数 `1-e^{-S/τ}` 的价值不止"持续时间"，更是给 hindsight 造了一条**连续可自举的目标轴**（3→5→10→20→25 步 ⇒ 0.26→0.39→0.63→0.86→0.92）| ✓ 强烈同意，而且**正样本比文档估计的还多**（见下）|
+| 加 `dual_*` 指标来检验"侧吸引子"假设 | ✓ 已实现 4 条 |
+
+**用回放数据加强文档的一点**：文档说"只观察到 3 步双持"。实际上 run #11 最终策略的**确定性回放**（`runs/render/hold_final/`，3 集）里，第 1 集的**双手同挂 B1 连续 52 步**（另两集 2 步和 7 步）。也就是说"双手稳定支撑"这个行为**已经真实出现过**，`h_dual` 能拿到的正样本上限不是 0.26 而是 **0.994**（$1-e^{-52/10}$）。⇒ 文档"不是要求策略发明全新行为，而是给已经偶然出现的行为加一个可被捕获的坐标"这个论证，比文档自己写的更强。
+
+**我要补的两点（文档没覆盖）**
+
+1. **`c_sup = max(c_L,c_R)` 这一维的标定问题（既有、且会影响 run #13 的读数）**：它的 goal 值来自关键帧的 `c=1`（手"埋"在指笼里），但**稳定悬挂时抓手点会漂到 3–4.5 cm ⇒ 实测 `max(c)≈0.55`**，于是 $(1-0.55)^2≈0.20$ 是每个距离里一个**下不去的常数**。实测：吊在起始杆时 `dist=0.76`（= $\sqrt{0.606^2+0.20+0.005}$ ✓ 完全吻合）。后果：**即使完美到位 + 双持 25 步，`dist` 也只能到 ≈0.45 > 0.35 ⇒ `success` 对"稳定悬挂"永远不亮**（run #11 里 `succ` 只在撞击/受力把手"埋"深时才亮，正是这个原因）。
+   ⇒ run #13 仍按文档保持干净 A/B（不动 `c_sup`），但**读数请以 `dual_*`、`len`、`fell`、`dist` 为准，别用 `success`**；下一枪（run #14）建议把 `c_sup` 从 goal 里去掉（它现在与 `h_any`/`h_dual` 语义重复，且目标值不可达）。
+2. **命名/编号**：文档里的"run #12"在我们日志里是 run #13（run #12 = 我那条 `advance` 平移不变目标线，已停在代码里、未采用）。这次按文档走 `support_dual`。
+
+### 9.40.2 实现（`--goal-variant support_dual`）
+
+$$g=\big[\underbrace{x,z,p_L(3),p_R(3)}_{\text{绝对位置（8）}},\;\underbrace{\max(c_L,c_R)}_{\text{接触}},\;\underbrace{h_{\rm any}}_{1-e^{-S_{\rm any}/10}},\;\underbrace{h_{\rm dual}}_{1-e^{-S_{\rm dual}/10}}\big]\quad(11\ \text{维})$$
+
+- `S_dual(t+1) = S_dual(t)+1` 若"**存在一根杆，两只手都在它 5 cm 窗内**"，否则归零；`S_any` 沿用 run #11 的定义（至少一只手在任意杆窗内）。
+- state = 144（141 + `c_sup` + `h_any` + `h_dual`），goal = 11，obs = 155；`goal_indices = (0,2,99..104,127,128,129)`。
+- **两个 streak 都在 state 里**（文档要求；goal 是 state 的切片，所以这是自然结果）。
+- 新指标（评估器里已加）：
+  | 指标 | 求和 = |
+  |---|---|
+  | `cov_dual_runmax_improve` | 本集 **最长** $S_{\rm dual}$（文档的 `dual_streak_max`）|
+  | `cov_dual_on_steps` | 双持步数（文档的 `dual_support_steps`）|
+  | `cov_single_on_steps` | 单手支撑步数（文档的 `single_support_steps`）|
+  | `cov_dual_hold_sum` | $\sum_t h_{\rm dual}(t)$（双持质量的时间积分）|
+- **三层结构数值验证**（CPU，HOLD/松手三种状态）：
+
+  | 状态 | `h_any` | `h_dual` | `S_dual` | dist |
+  |---|---|---|---|---|
+  | 双手挂起始杆（dual）| 0.95 | **0.95** | 30 | 0.76 |
+  | 左手松开（single）| 0.99 | **0.00** | 0 | 1.25 |
+  | 双手都松开（flight）| **0.00** | 0.00 | 0 | 4.03 |
+
+  ⇒ goal 空间里 flight → single → dual 三层被明确区分（single 比 dual 远 0.5），正是文档要的几何。
+- ⚠️ 与 run #11 的 checkpoint **不兼容**（obs 153→155）⇒ 新跑。
+
+### 9.40.3 run #13 命令与判据
+
+```bash
+.venv-warp/bin/python src/check_args.py && .venv-warp/bin/python src/check_metrics.py
+
+.venv-warp/bin/python src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant support_dual --train-goal-bar 1 --eval-goal-bar 1 \
+  --expl-hold 10 --num-evals 20 --steps 12200000 \
+  --checkpoint-dir runs/ckpt_dual --save-every 5 \
+  --impl warp --scene full035 --wandb --exp-name brach_dual_b1
+```
+
+（与 run #11 逐项相同，**只把 `--goal-variant support` 换成 `support_dual`** ⇒ 干净的 +1 维 A/B。）
+
+| 曲线 | 预期（若"侧吸引子"假设正确）| 若相反 |
+|---|---|---|
+| `cov_dual_runmax_improve` | 3 → 5 → 10 → 20 …（**先于** episode 变长上升）| 长期卡在 2–3 |
+| `cov_dual_hold_sum` / `cov_dual_on_steps` | 单调上升 | 不动 |
+| `cov_single_on_steps` | 先升（探索期）后**下降** | 一直高 |
+| `len` / `fell` | 在 dual 指标之后跟着改善 | 不动 |
+| `dist`（**别看 `success`**，见 9.40.1）| 从 ~0.78 往下 | 不动 |
+
+若 $S_{\rm dual}$ 长期卡 2–3 且右手每次到杆后**物理滑脱** ⇒ 按文档的判据：问题已不在 goal，而在**抓握动力学 / action representation / 接触控制**，那时再转向那条线（M3.0 的接触/抓手分析、指力、`expl_hold` 尺度）。

@@ -128,8 +128,8 @@ def parse() -> argparse.Namespace:
                          "'reach' = sized from the M3.0 IK solve. See M3.0b in "
                          "docs/执行计划.md")
     ap.add_argument("--goal-variant", default="full",
-                    choices=["full", "support", "support_hold", "position",
-                             "cross", "cross3", "hold2", "advance"],
+                    choices=["full", "support", "support_hold", "support_dual",
+                             "position", "cross", "cross3", "hold2", "advance"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
                          "support = [...,max(c_L,c_R)] (9-D, releasing ONE hand is free but "
                          "losing the last grip is penalised); support_hold = support + the "

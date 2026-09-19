@@ -130,8 +130,13 @@ def main() -> int:
     grasp = jax.jit(jax.vmap(env._grasp))
     # Goal variants that use the sustained-contact entry ("support_hold") need the
     # streak from info; `_hold_feature` keeps the single source of truth for the map.
-    uses_hold = "hold" in str(cfg.get("goal_variant", ""))
-    if uses_hold:
+    variant_cfg = str(cfg.get("goal_variant", ""))
+    uses_hold = "hold" in variant_cfg
+    uses_dual = variant_cfg == "support_dual"
+    if uses_dual:
+        achieved = jax.jit(jax.vmap(lambda ps, h, hd: env._achieved_goal(
+            ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd))))
+    elif uses_hold:
         achieved = jax.jit(jax.vmap(lambda ps, h: env._achieved_goal(ps, env._hold_feature(h))))
     else:
         achieved = jax.jit(jax.vmap(env._achieved_goal))
@@ -157,8 +162,15 @@ def main() -> int:
         dmin = d.min(axis=-1)
         bar = np.where(dmin < 0.05, w.argmax(axis=-1), -1)
         # measure the goal distance ourselves: reset() seeds metrics with zeros
-        diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"]))
-                if uses_hold else np.asarray(achieved(s.pipeline_state))) - np.asarray(s.info["goal"])
+        if uses_dual:
+            diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
+                                        s.info["dual_streak"]))
+                    - np.asarray(s.info["goal"]))
+        elif uses_hold:
+            diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"]))
+                    - np.asarray(s.info["goal"]))
+        else:
+            diff = np.asarray(achieved(s.pipeline_state)) - np.asarray(s.info["goal"])
         rec["dist"][i] = np.linalg.norm(diff, axis=-1)
         rec["dist_pos"][i] = np.linalg.norm(diff[:, :8], axis=-1)   # position-only view (drop c_L,c_R)
         rec["c_L"][i] = np.exp(-(dmin[:, 0] / 0.04) ** 2)
