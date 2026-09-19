@@ -1749,3 +1749,88 @@ JAX_PLATFORMS=cpu MUJOCO_GL=egl .venv-warp/bin/python src/render_policy.py \
 | D | 什么都不改，跑满 4 h | — | 最后 4 M 步全部指标已平（succ 6–7、最近 0.006–0.012），鱼跃是稳定吸引子 ⇒ 预期收益低，**不建议** |
 
 推荐 **(C)**，若 (C) 之后 `cov_air_runmax` 仍 ~11 且 `cov_b1_runmax` 不涨（说明策略宁可选鱼跃也不肯保持），再上 **(B)** 把滞空直接禁掉。
+
+## 9.34 M3 收尾：`support_hold`（把"持续接触"写进**目标状态**）+ 修掉一个一直在骗人的指标 bug
+
+### 9.34.1 ⚠️ 先修 bug：`max_bar` 与 `dwell_success` 从第一版起就是错的
+
+`_coverage()` 以前返回 `dict(info)`（整份 info 的拷贝 + 覆盖率键），而 `step()` 把它作为**最后一次** `info.update()` 应用 ⇒ 它把 `max_bar`、`dwell`、`prev_bar`、`switches_total` **回退成上一步的值**。后果：
+
+| 量 | bug 期间的真实含义 | 应有含义 |
+|---|---|---|
+| `dwell` | 永远 ≤1（每步都被回退成 0）⇒ **`dwell_success` 在任何 run 里都不可能为 1** | 连续 25 步"成功且慢" |
+| `max_bar` | **当前这一步**的杆号（不是 episode 最大值） | 本 episode 抓握过的最大杆号 |
+| `prev_bar` | 上上步的杆号 ⇒ `hand_switches` 是"与 2 步前比"（偏小） | 与上一步比 |
+| `switches_total` | 从不累加 | 累加 |
+
+所以：**旧 run 表里的 `max_bar` 要读作"这一步手在 $B_k$ 上"的逐步求和**（§9.31–9.33 的表就是这么用的，结论不受影响）；而 **`dwell_success` 在所有旧 run 里恒 0 是 bug，不是策略行为**。
+
+修法：`_coverage()` 只返回覆盖率键（不再拷贝整份 info）+ `step()` 把权威值放到**最后一次** update。覆盖率指标本身一直是对的（它们的键只在 `_coverage` 里更新）；M1 的 `check_reset` 用直接算出的抓手判据，也不受影响。
+
+### 9.34.2 新变体 `support_hold`（"M3 收尾"这一枪）
+
+$$g=\underbrace{[x,z,p_L(3),p_R(3),\max(c_L,c_R)]}_{\text{= support}}\;+\;\underbrace{\big[\,1-e^{-\text{streak}/10}\,\big]}_{\text{hold}}$$
+
+`streak` = **连续**"至少一只手在任意杆 5 cm 抓握窗内"的步数；一旦两手都出窗立刻归零。
+
+- 位置 8 维与连续谱全部保留（避开 §9.31.1 的退化），只多 1 维、尺度 0–1、平滑（5 步 0.39 / 10 步 0.63 / 25 步 0.92）——**不是 25 步硬阈值**，否则 run #10 实测只有 4–7 步，梯度会饿死。
+- **这就是"不限制策略、只设计目标状态"**：鱼跃依然允许，但它的终点不再是目标状态。run #10 回放里策略最好的一刻是 `dist=0.06`（位置维已到位），而那一刻 `hold≈0`（两手刚离杆/刚碰杆）⇒ 加了 hold 后**该时刻的 `dist≈1.0`**；真的抓住 $B_1$ 并撑住 25 步 ⇒ `hold≈0.92` ⇒ `dist≲0.1`。
+- `success = dist < 0.35` 因此变成"**到位 且 保持约 0.3–0.5 s**"，与 M1/M3 的验收口径（吊挂保持一段时间）一致。`dwell_success`（修好后）是它的天然读数。
+- ⚠️ `streak` 用 5 cm 判据（`GRASP_THRESH`，与 `bar_L/bar_R/max_bar` 同源），**不是** `_coverage` 里的 `max(c)>0.5`（3.3 cm）：实测稳定悬挂时抓手点会从杆心漂到 **3–4.5 cm**（"钩住"状态），用 3.3 cm 会把经过 M1 验证的正常悬挂判成"没抓住"。
+
+**CPU 数值校验**（`--scene full035 --goal-bar 1`，`envs=2`）：
+
+| 检查 | 结果 |
+|---|---|
+| 布局 | `state=143 / goal=10 / obs=153`，`goal_indices=(0,2,99..104,127,128)` ✓ |
+| goal_set | 每根杆 `c_sup=1.00, hold=1.00`，`x` 按杆距平移 ✓ |
+| reset 后两手 | `dmin = 0.0015 / 0.0033 m`（远离 5 cm 边界，属正常"埋进指笼"） |
+| HOLD 30 步 | `streak 1→5→10→25→30`、`hold 0.095→0.393→0.632→0.918→0.950` ✓ 与设计表一致 |
+| 同 30 步 | `max_bar=0`（正确：一直在 $B_0$）、`dwell=0`、`switches_total=1`、`dist 1.17→0.73`（只剩位置维 + `c_sup≈0.6` 的残留）✓ |
+
+obs 153 ⇒ **与旧 checkpoint 不兼容**（新跑，不能续训）。
+
+### 9.34.3 run #11 命令 + 判据
+
+```bash
+.venv-warp/bin/python src/check_args.py && .venv-warp/bin/python src/check_metrics.py
+
+.venv-warp/bin/python src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant support_hold --train-goal-bar 1 --eval-goal-bar 1 \
+  --expl-hold 10 --num-evals 20 --steps 12200000 \
+  --checkpoint-dir runs/ckpt_hold --save-every 5 \
+  --impl warp --scene full035 --wandb --exp-name brach_hold_b1
+```
+
+| 现象 | 判读 | 下一步 |
+|---|---|---|
+| `cov_air_runmax` 仍 ~11、`cov_b1_runmax` 3–7、`succ` 掉到 ~0 | 策略仍偏好鱼跃（现在不达标），只是还没学会软着陆 | `--entropy-param 1.6` 降噪；或换 `cross` 目标（§9.33.4 A） |
+| `cov_air_runmax` 下降、`cov_b1_runmax` ≥25、`dwell_success` > 0 | **"抓住并保持"出现了** = M3 单杆闭环 | 跑满 4 h + 出视频，然后进 M4 |
+| `len` 回到 300–500 且 `dist` 稳在低位 | 已能稳定停在 $B_1$ | 直接 M4（设计草案见 `docs/执行计划.md` 的 M4 节） |
+
+⚠️ 因为改了指标语义，本 run 的 `max_bar`/`dwell_success`/`hand_switches` **与旧 run 不可直接比**；`len`/`fell`/`succ`/`C(r)`/`cov_*` 仍可比。
+
+### 9.34.4 代码版本管理（本轮同时做的工程改动）
+
+从这一轮起项目根目录是 git 仓库（`main` = run #10 结束时的工作树快照）：
+
+- 每个实验一个分支，例如本次 `m3/hold-goal`；`git checkout main` 即可回到上一次的代码，`git log --oneline` 看全部版本；
+- 每次跑 GPU 前 `python src/train.py ...` 会把 **`git_commit`（含 `-dirty` 标记）写进 `args.json` 与 checkpoint 的 config** ⇒ 任何一个结果都能回溯到确切的代码版本；
+- `third_party/jaxgcrl` 是上游浅克隆、被 `.gitignore` 排除，**我们对它的改动由 `patches/jaxgcrl_crl_losses.patch` 版本化**——本轮发现该 patch 已经过期（评估器白名单后来加过键），已用新增的 **`tools/make_patch.sh`** 重新生成并校验（它会 `git apply -R --check`，对不上就报错），以后改 jaxgcrl 必须跑它。
+
+### 9.34.5 `--smoke` 配置的 `critic_loss=nan` 是**老问题**（A/B 证据），不是本轮改动引入的
+
+`--smoke`（4 envs / batch 100 / min_replay 50 / episode 101 / unroll 20）跑 `support_hold` 时 `critic_loss/actor_loss/logits_*` 全为 nan。做了三组 A/B（同样的 flag，只换一个变量）：
+
+| 代码 | 场景 | goal | 结果 |
+|---|---|---|---|
+| 本轮分支 | `full035` | `support` | **nan** |
+| 本轮分支 | `full` | `support_hold` | **nan** |
+| **baseline `52b2c3e`（`git worktree` 检出、完全未改）** | `full035` | `support` | **nan** |
+
+⇒ **与 `support_hold` 无关、与 `full035` 无关、与本轮的指标修复无关**：tiny smoke 配置本身就会发散（4 envs、50 条 transition 就开始训练，`l2` 能量在 float32 下 `-inf`，`diag - logsumexp` 变 `inf - inf`）。真实配置不会（run #7–#10 共 12M 步的 `critic_loss` 一直是 3.5–5.0 的有限值）。
+
+`--smoke` 仍然是**接线测试**（能验 obs/goal 维度、指标键、checkpoint 落盘），但**不能当数值健康检查**。
+
+顺带加了一个 **NaN 守卫**：连续 3 个 eval 的 `critic_loss`/`actor_loss`/`logits_pos` 出现 nan 就打印并 `SystemExit(2)`（保留已写出的 checkpoint），免得 1.5 h 的 GPU run 白跑。

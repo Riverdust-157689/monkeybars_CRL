@@ -107,7 +107,8 @@ def main() -> int:
             problems.append(f"metric {k!r} zero-initialised but never emitted")
     for k in info_reads:
         if k not in zero_i and not k.startswith(("goal", "dwell", "prev_bar",
-                                                 "max_bar", "switches_total")):
+                                                 "max_bar", "switches_total",
+                                                 "hold_streak")):
             problems.append(f"info[{k!r}] read but not in _cov_zero_info")
 
     print(f"metrics emitted by _coverage : {len(emitted)}")

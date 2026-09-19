@@ -128,13 +128,17 @@ def parse() -> argparse.Namespace:
                          "'reach' = sized from the M3.0 IK solve. See M3.0b in "
                          "docs/执行计划.md")
     ap.add_argument("--goal-variant", default="full",
-                    choices=["full", "support", "position", "cross", "cross3", "hold2"],
+                    choices=["full", "support", "support_hold", "position",
+                             "cross", "cross3", "hold2"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
                          "support = [...,max(c_L,c_R)] (9-D, releasing ONE hand is free but "
-                         "losing the last grip is penalised); position = [x,z,p_L(3),p_R(3)] "
-                         "(8-D, grasp ignored -> the policy can learn to hang without "
-                         "grasping).  See docs/M2_JaxGCRL接入记录.md 9.22/9.25.  "
-                         "Must match at eval time.")
+                         "losing the last grip is penalised); support_hold = support + the "
+                         "sustained-contact entry 1-exp(-streak/10) (10-D) so that merely "
+                         "*touching* the target bar no longer satisfies the goal -- the "
+                         "terminal state has to be one the robot can stay in; "
+                         "position = [x,z,p_L(3),p_R(3)] (8-D, grasp ignored -> the policy "
+                         "can learn to hang without grasping).  See "
+                         "docs/M2_JaxGCRL接入记录.md 9.22/9.25/9.34.  Must match at eval time.")
     ap.add_argument("--goal-position-only", type=int, default=0,
                     help="deprecated alias for --goal-variant position")
     ap.add_argument("--discounting", type=float, default=0.995)
@@ -198,8 +202,32 @@ def parse() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def git_rev() -> str:
+    """Short commit hash of the tree this run is executed from (``-dirty`` if modified).
+
+    Recorded in ``args.json`` and in every checkpoint so a result can always be
+    traced back to the exact source version (see docs/M2_JaxGCRL接入记录.md 9.34.4).
+    Never raises: falls back to "unknown" outside a git checkout.
+    """
+    import subprocess
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO,
+                              capture_output=True, text=True, timeout=5)
+        if head.returncode != 0:
+            return "unknown"
+        rev = head.stdout.strip()
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=REPO,
+                            capture_output=True, text=True, timeout=5)
+        if st.returncode == 0 and st.stdout.strip():
+            rev += "-dirty"
+        return rev or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def main() -> int:
     args = parse()
+    args.git_commit = git_rev()
     if args.smoke:
         args.steps = 4000
         args.num_envs = 4
@@ -355,7 +383,7 @@ def main() -> int:
           f"repr_dim={args.repr_dim} activation={'relu' if USE_RELU else 'swish'} "
           f"LN(encoders)={bool(args.use_ln)} (Actor has no LN switch upstream)")
     print(f"[loss] preset={args.preset} {cfg}")
-    print(f"[run] steps={run.total_env_steps} num_envs={run.num_envs} "
+    print(f"[run] git={args.git_commit} steps={run.total_env_steps} num_envs={run.num_envs} "
           f"episode_length={run.episode_length} batch={args.batch_size} gamma={args.discounting}")
 
     if args.wandb:
@@ -366,6 +394,7 @@ def main() -> int:
         print(f"[wandb] project={args.wandb_project} name={exp} mode={args.wandb_mode}")
 
     rows = []
+    nan_evals = 0          # consecutive evals with NaN training metrics (guard below)
     csv = os.path.join(run_dir, "progress.csv")
 
     def save_actor(dest, actor_params, steps):
@@ -386,7 +415,8 @@ def main() -> int:
                            state_dim=train_env.state_dim,
                            goal_variant=str(train_env.goal_variant),
                            goal_size=int(train_env.goal_size),
-                           action_window=str(train_env.action_window)),
+                           action_window=str(train_env.action_window),
+                           git_commit=str(args.git_commit)),
 
         }
         tag = f"actor_{int(steps):09d}.pkl" if steps >= 0 else "actor_final.pkl"
@@ -422,6 +452,20 @@ def main() -> int:
             n = len(rows) - 1
             if n % args.save_every == 0:
                 save_actor(args.checkpoint_dir, params, int(num_steps))
+
+        # NaN guard: a diverged critic (logits = -inf -> inf - inf) poisons the whole
+        # run, and on the GPU that only shows up 1.5 h later.  Treat 3 consecutive
+        # NaN evals as a dead run and stop, keeping the checkpoints written so far.
+        nonlocal nan_evals
+        bad = any(metrics.get(k) != metrics.get(k) for k in
+                  ("training/critic_loss", "training/actor_loss", "training/logits_pos"))
+        nan_evals = nan_evals + 1 if bad else 0
+        if bad:
+            print(f"  [warn] NaN training metrics ({nan_evals}/3 consecutive) -- "
+                  f"see docs/M2_JaxGCRL接入记录.md 9.34.5", flush=True)
+        if nan_evals >= 3:
+            print("[abort] training diverged to NaN; checkpoints kept.  Stopping.", flush=True)
+            raise SystemExit(2)
 
     t0 = time.time()
     train_fn, params, _ = agent.train_fn(train_env=train_env, eval_env=eval_env,

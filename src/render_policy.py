@@ -117,7 +117,8 @@ def main() -> int:
                   skip_connections=skip, use_relu=False)
 
     E, T = args.episodes, args.steps
-    print(f"[render] ckpt={args.ckpt} steps={ckpt_steps} scene={scene} impl={impl} "
+    print(f"[render] ckpt={args.ckpt} steps={ckpt_steps} git={cfg.get('git_commit', '?')} "
+          f"scene={scene} impl={impl} "
           f"W={h_dim} D={n_hidden} skip={skip} n_frames={n_frames} "
           f"goal_bar={goal_bar} goal_variant={variant} action_window={window} "
           f"obs={env.observation_size} episodes={E} steps={T} "
@@ -127,7 +128,13 @@ def main() -> int:
     reset = jax.jit(jax.vmap(env.reset))
     step = jax.jit(jax.vmap(env.step))
     grasp = jax.jit(jax.vmap(env._grasp))
-    achieved = jax.jit(jax.vmap(env._achieved_goal))
+    # Goal variants that use the sustained-contact entry ("support_hold") need the
+    # streak from info; `_hold_feature` keeps the single source of truth for the map.
+    uses_hold = "hold" in str(cfg.get("goal_variant", ""))
+    if uses_hold:
+        achieved = jax.jit(jax.vmap(lambda ps, h: env._achieved_goal(ps, env._hold_feature(h))))
+    else:
+        achieved = jax.jit(jax.vmap(env._achieved_goal))
     state = reset(jax.random.split(jax.random.PRNGKey(args.seed), E))
 
     def act(params, obs, key):
@@ -150,7 +157,8 @@ def main() -> int:
         dmin = d.min(axis=-1)
         bar = np.where(dmin < 0.05, w.argmax(axis=-1), -1)
         # measure the goal distance ourselves: reset() seeds metrics with zeros
-        diff = np.asarray(achieved(s.pipeline_state)) - np.asarray(s.info["goal"])
+        diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"]))
+                if uses_hold else np.asarray(achieved(s.pipeline_state))) - np.asarray(s.info["goal"])
         rec["dist"][i] = np.linalg.norm(diff, axis=-1)
         rec["dist_pos"][i] = np.linalg.norm(diff[:, :8], axis=-1)   # position-only view (drop c_L,c_R)
         rec["c_L"][i] = np.exp(-(dmin[:, 0] / 0.04) ** 2)
