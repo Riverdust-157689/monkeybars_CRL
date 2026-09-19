@@ -90,7 +90,7 @@ index 6cc7996..d1a5e88 100644
          logging.info("total steps: %s", total_steps)
  
 diff --git a/jaxgcrl/utils/evaluator.py b/jaxgcrl/utils/evaluator.py
-index 1ff4a94..e9f40e4 100644
+index 1ff4a94..26b0a91 100644
 --- a/jaxgcrl/utils/evaluator.py
 +++ b/jaxgcrl/utils/evaluator.py
 @@ -133,7 +133,34 @@ class ActorEvaluator:
@@ -121,8 +121,8 @@ index 1ff4a94..e9f40e4 100644
 +                        "cov_b1_runmax_improve",
 +                        "cov_xfer_runmax_improve",
 +                        "cov_air_runmax_improve",
-+                        # M4: furthest bar index with a sustained grip
-+                        "kref_max",
++                        # M4: how many bars the episode advanced (sustained grips)
++                        "advance_max",
                      ]
 +                    if name in eval_metrics.episode_metrics
                  }

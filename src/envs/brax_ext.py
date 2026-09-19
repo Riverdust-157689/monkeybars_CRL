@@ -49,6 +49,13 @@ class MjxAutoResetWrapper(Wrapper):
         state = self.env.reset(rng)
         state.info["first_pipeline_state"] = state.pipeline_state
         state.info["first_obs"] = state.obs
+        # The episode's own t=0 bookkeeping: the auto-reset restores the first
+        # state, so the counters must go back to THOSE values.  A hard-coded zero
+        # would be wrong whenever t=0 is not 0 (--start-bar-max sets k_ref/k_start
+        # to the starting bar).
+        if self.episode_zero:
+            state.info["_first_episode_info"] = {
+                k: state.info[k] for k in self.episode_zero if k in state.info}
         return state
 
     def step(self, state: State, action: jax.Array) -> State:
@@ -83,9 +90,11 @@ class MjxAutoResetWrapper(Wrapper):
 
         # episode-scoped info: back to its t=0 value on the environments that just
         # finished an episode (all of these are batched by VmapWrapper)
+        first = state.info.get("_first_episode_info", {})
         for key, zero in self.episode_zero.items():
             if key not in state.info:
                 continue
+            zero = first.get(key, zero)
             cur = state.info[key]
             done = state.done
             if getattr(cur, "ndim", 0) >= 1 and cur.shape[0] == done.shape[0]:

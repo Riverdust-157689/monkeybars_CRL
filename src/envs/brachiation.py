@@ -223,7 +223,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     prev_action = nxt(14)
     # M4 "advance" block: the four relative dims are goal entries AND therefore must
     # live in the state, plus k_ref (context for the critic) and the torque margin.
-    advance = nxt(5) if goal_variant == "advance" else slice(i, i)
+    advance = nxt(6) if goal_variant == "advance" else slice(i, i)
     kref = nxt(1) if goal_variant == "advance" else slice(i, i)
     margin = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
@@ -242,7 +242,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     elif goal_variant == "advance":
         # goal = [dx, dz, c_L,next, c_R,next, hold_next] + the torque margin
         # (k_ref stays context: it is progress, not a target)
-        goal_indices = tuple(advance.start + k for k in range(5)) + (margin.start,)
+        goal_indices = tuple(advance.start + k for k in range(6)) + (margin.start,)
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
                          grasp_support, hold, cross, prev_action, advance, kref, margin,
@@ -318,8 +318,8 @@ class Brachiation(Env):
              "cross3": [14, 15, 16],
              "hold2": [17, 15],
              # M4 superset tail: [.., hold(19), dx, dz, c_Lnext, c_Rnext,
-             #                    hold_next, margin]
-             "advance": [20, 21, 22, 23, 24, 25]}[self.goal_variant],
+             #                    hold_next, progress, margin]
+             "advance": [20, 21, 22, 23, 24, 25, 26]}[self.goal_variant],
             dtype=jnp.int32)
         self.goal_size = int(len(self.goal_indices))
         self.goal_reach_thresh = goal_reach_thresh
@@ -543,7 +543,8 @@ class Brachiation(Env):
                 "hold_streak": jnp.zeros(())}
 
     def _state_features(self, data, prev_action: jnp.ndarray,
-                        hold: jnp.ndarray = 0.0, kref: jnp.ndarray = 0.0) -> jnp.ndarray:
+                        hold: jnp.ndarray = 0.0, kref: jnp.ndarray = 0.0,
+                        progress: jnp.ndarray = 0.0) -> jnp.ndarray:
         d, w = self._grasp(data)
         dmin = d.min(axis=-1)
         c = jnp.exp(-(dmin / TAU_CONTACT) ** 2)          # soft "grasping" indicator
@@ -566,7 +567,7 @@ class Brachiation(Env):
             parts.append(cont(d[1, CROSS_SUPPORT])[None])   # c_RB0
         parts.append(prev_action)
         if self.goal_variant == "advance":
-            parts.append(self._advance_features(data, kref, hold))
+            parts.append(self._advance_features(data, kref, hold, progress))
             parts.append((jnp.asarray(kref) / max(self.n_bars - 1, 1))[None])
         return jnp.concatenate(parts)
 
@@ -603,7 +604,10 @@ class Brachiation(Env):
         return np.concatenate([[kd.qpos[0], kd.qpos[2]], np.concatenate(p),
                                [c, c, c], rel, [dd, cont(dd), cont(dl0), cont(dl1),
                                                 cont(dr0)], [1.0],
-                               [dx_goal, 0.0, 1.0, 1.0, 1.0, margin]]).astype(np.float32)
+                               # instruction goal: "arrive at the next bar and stay"
+                               # (progress = 0, i.e. do not ask for the *next* advance;
+                               # the relabelled training goals carry the real progress)
+                               [dx_goal, 0.0, 1.0, 1.0, 1.0, 0.0, margin]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -620,7 +624,7 @@ class Brachiation(Env):
         return ctrl
 
     def _achieved_goal(self, data, hold: jnp.ndarray = 0.0,
-                       kref: jnp.ndarray = 0.0) -> jnp.ndarray:
+                       kref: jnp.ndarray = 0.0, progress: jnp.ndarray = 0.0) -> jnp.ndarray:
         # `hold` means "the sustained-contact scalar this variant uses":
         #   support_hold -> at least one hand on ANY bar
         #   advance      -> at least one hand on the NEXT bar
@@ -640,7 +644,7 @@ class Brachiation(Env):
             cont(d[0, CROSS_TARGET])[None],    # c_LB1
             cont(d[1, CROSS_SUPPORT])[None],   # c_RB0
             jnp.asarray(hold)[None],           # index 19: sustained contact
-            self._advance_features(data, kref, hold)])   # indices 20..25 (M4)
+            self._advance_features(data, kref, hold, progress)])   # indices 20..26 (M4)
         return full[self._goal_full_idx]
 
     def _hold_feature(self, streak: jnp.ndarray) -> jnp.ndarray:
@@ -652,7 +656,7 @@ class Brachiation(Env):
         load = jnp.abs(data.qfrc_bias[self.margin_dof]) / self.margin_lim
         return jnp.clip(1.0 - jnp.max(load), 0.0, 1.0)
 
-    def _advance_features(self, data, kref, hold_next=0.0) -> jnp.ndarray:
+    def _advance_features(self, data, kref, hold_next=0.0, progress=0.0) -> jnp.ndarray:
         """[dx, dz, c_L,next, c_R,next, hold_next, margin] relative to bar k_ref+1.
 
         Translation invariant (dx/dz are differences) and progress invariant (the
@@ -672,7 +676,8 @@ class Brachiation(Env):
         dz = data.qpos[2] - self.key_qpos[2]
         c_next = jnp.exp(-(d[:, k] / TAU_NEXT) ** 2)
         return jnp.concatenate([dx[None], dz[None], c_next,
-                                jnp.asarray(hold_next)[None], self._margin(data)[None]])
+                                jnp.asarray(hold_next)[None],
+                                jnp.asarray(progress)[None], self._margin(data)[None]])
 
     def episode_info_zero(self):
         """Reset values of the episode-scoped `info` entries at t=0.
@@ -687,6 +692,7 @@ class Brachiation(Env):
                 "k_ref": jnp.zeros(()), "k_ref_run": jnp.zeros(()),
                 "k_ref_run_bar": jnp.full((), -1.0),
                 "kref_max": jnp.zeros(()),
+                "k_start": jnp.zeros(()),
                 "next_streak": jnp.zeros(()),
                 **self._cov_zero_info()}
 
@@ -737,9 +743,15 @@ class Brachiation(Env):
         metrics = {k: jnp.zeros(()) for k in
                    ("reward", "success", "success_easy", "dist", "distance_from_origin",
                     "dwell_success", "max_bar", "bar_L", "bar_R", "hand_switches",
-                    "fell", "forward", "kref_max")}
+                    "fell", "forward", "advance_max")}
         metrics.update(self._cov_zero_metrics())
         info = {"goal": goal, **self.episode_info_zero()}
+        if self.goal_variant == "advance":
+            # The reference/progress origin is the bar the episode actually starts
+            # on -- with --start-bar-max > 0 that is not 0, and leaving k_ref at 0
+            # would make the first goal point AT (or behind) the robot.
+            info["k_start"] = k0
+            info["k_ref"] = k0
         return State(pipeline_state=data, obs=obs, reward=jnp.zeros(()), done=jnp.zeros(()),
                      metrics=metrics, info=info)
 
@@ -786,11 +798,18 @@ class Brachiation(Env):
         hold = (self._hold_feature(next_streak) if self.goal_variant == "advance"
                 else self._hold_feature(hold_streak))
 
-        feats = self._state_features(data, action, hold, k_ref)
+        # progress = how many bars this episode has advanced (raw count, so one
+        # bar is worth ~1.0 in the goal distance -- the same order as a contact
+        # entry).  Without it a *stably hanging* state and a future state one
+        # "progress level" later have identical relative features, so the majority
+        # of relabelled goals would be trivially matched and nothing would push the
+        # policy to keep going.
+        progress = k_ref - state.info["k_start"]
+        feats = self._state_features(data, action, hold, k_ref, progress)
         goal = state.info["goal"]
         obs = jnp.concatenate([feats, goal])
 
-        achieved = self._achieved_goal(data, hold, k_ref)
+        achieved = self._achieved_goal(data, hold, k_ref, progress)
         dist = jnp.linalg.norm(achieved - goal)
         success = (dist < self.goal_reach_thresh).astype(jnp.float32)
         slow = jnp.linalg.norm(data.qvel) < 1.0
@@ -816,9 +835,9 @@ class Brachiation(Env):
             # the running total lives in info["switches_total"]
             hand_switches=switched.astype(jnp.float32),
             fell=fell,
-            # M4 headline: furthest bar index with a SUSTAINED grip this episode
-            # (0 = never left the start bar, 1 = advanced one bar, ...)
-            kref_max=kref_max,
+            # M4 headline: how many bars this episode ADVANCED (0 = never left the
+            # start bar, 1 = one bar, ...), i.e. relative to where it started.
+            advance_max=jnp.maximum(kref_max - state.info["k_start"], 0.0),
         )
         # NB: carry the existing info/metrics dicts forward — JaxGCRL's
         # TrajectoryIdWrapper and brax's EpisodeWrapper add keys (traj_id, steps,
