@@ -86,6 +86,23 @@ def main() -> int:
         and n.value.id == "state.info" and isinstance(n.slice, ast.Constant)
         and isinstance(n.slice.value, str)})
 
+    problems = []
+
+    # ---- step() metrics vs reset() zero-init (pytree structure must match) ----
+    reset_fn = _find(cls, "reset", ast.FunctionDef)
+    zero_step = {n.value for n in ast.walk(reset_fn)
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    step_writes = set()
+    for call in ast.walk(step):
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
+                and call.func.attr == "update":
+            step_writes |= {k.arg for k in call.keywords if k.arg}
+    # names written in step but absent from reset break EpisodeWrapper's scan
+    for k in sorted(step_writes - zero_step):
+        if k not in ("goal", "max_bar", "dwell", "prev_bar", "hold_streak",
+                     "switches_total", "k_ref", "k_ref_run", "k_ref_run_bar", "kref_max"):
+            problems.append(f"metrics key {k!r} written in step() but not zeroed in reset()")
+
     ev = open(EVALUATOR).read()
     ev_names = set(re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', ev))
 
@@ -96,7 +113,6 @@ def main() -> int:
         if isinstance(n, ast.Constant) and isinstance(n.value, str)
         and re.fullmatch(r"cov_[a-z0-9_]*_run", n.value)})
 
-    problems = []
     for k in emitted:
         if k not in zero_m:
             problems.append(f"metric {k!r} emitted by _coverage but not zero-initialised")
@@ -108,7 +124,8 @@ def main() -> int:
     for k in info_reads:
         if k not in zero_i and not k.startswith(("goal", "dwell", "prev_bar",
                                                  "max_bar", "switches_total",
-                                                 "hold_streak")):
+                                                 "hold_streak", "k_ref", "k_ref_run",
+                                                 "k_ref_run_bar", "kref_max")):
             problems.append(f"info[{k!r}] read but not in _cov_zero_info")
 
     print(f"metrics emitted by _coverage : {len(emitted)}")

@@ -129,7 +129,7 @@ def parse() -> argparse.Namespace:
                          "docs/执行计划.md")
     ap.add_argument("--goal-variant", default="full",
                     choices=["full", "support", "support_hold", "position",
-                             "cross", "cross3", "hold2"],
+                             "cross", "cross3", "hold2", "advance"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
                          "support = [...,max(c_L,c_R)] (9-D, releasing ONE hand is free but "
                          "losing the last grip is penalised); support_hold = support + the "
@@ -139,6 +139,11 @@ def parse() -> argparse.Namespace:
                          "position = [x,z,p_L(3),p_R(3)] (8-D, grasp ignored -> the policy "
                          "can learn to hang without grasping).  See "
                          "docs/M2_JaxGCRL接入记录.md 9.22/9.25/9.34.  Must match at eval time.")
+    ap.add_argument("--start-bar-max", type=int, default=0,
+                    help="M4: reset on a uniformly random bar in [0, k] by translating "
+                         "the robot by k*spacing (bars are periodic, so the physics is "
+                         "identical).  Requires --goal-variant advance, whose goal is "
+                         "bar-independent.")
     ap.add_argument("--goal-position-only", type=int, default=0,
                     help="deprecated alias for --goal-variant position")
     ap.add_argument("--discounting", type=float, default=0.995)
@@ -269,9 +274,11 @@ def main() -> int:
                       goal_bar_min=args.train_goal_bar_min,
                       goal_variant=goal_variant,
                       action_window=args.action_window,
+                      start_bar_max=args.start_bar_max,
                       njmax=args.njmax,
                       naconmax=max(1024, args.naconmax_per_world * args.num_envs))
-    is_cross = goal_variant in ("cross", "cross3", "hold2")
+    # variants with ONE bar-independent instruction goal (no --train-goal-bar)
+    is_cross = goal_variant in ("cross", "cross3", "hold2", "advance")
     if is_cross:
         print(f"[goal] variant={goal_variant} has ONE fixed instruction goal; "
               "--train-goal-bar/--eval-goal-bar are ignored")

@@ -100,11 +100,29 @@ class FeatureLayout(NamedTuple):
     hold: slice            # sustained-contact feature 1-exp(-streak/HOLD_TAU)
     cross: slice           # [p_R - p_B1 (3), c_{R,B1}, c_{L,B0}]  (only variant "cross")
     prev_action: slice
+    advance: slice         # M4: [dx, dz, c_L,next, c_R,next] relative to bar k_ref+1
+    kref: slice            # M4: k_ref / (n_bars - 1)   (state only, NOT a goal entry)
+    margin: slice          # M4: 1 - max_j |qfrc_bias_j| / tau_max_j
     state_dim: int
     goal_indices: Tuple[int, ...]
 
 
-GOAL_VARIANTS = ("full", "support", "support_hold", "position", "cross", "cross3", "hold2")
+GOAL_VARIANTS = ("full", "support", "support_hold", "position", "cross", "cross3",
+                 "hold2", "advance")
+
+# ---- M4.0 "advance one bar" ------------------------------------------------
+# The reference bar `k_ref` is the bar of the last *sustained* grip (>= K_SUSTAIN
+# consecutive steps with a hand inside its grasp window).  Everything the `advance`
+# goal asks for is expressed RELATIVE to bar k_ref+1, so the same goal means "the
+# next bar" at every bar -- which is what makes multi-bar traversal representable
+# with a single instruction goal.  Nothing here constrains the *strategy*: a
+# ballistic dive is still allowed, but the goal only counts when the robot ends up
+# hanging under the next bar with BOTH hands on it (the two contact entries are
+# per-hand and target specific -- that is also what removes the one-handed
+# attractor of `support`/`support_hold`, where max(c_L,c_R) was satisfied by one
+# hand alone).
+K_SUSTAIN = 3           # steps a grip must last before it advances `k_ref`
+
 
 # "support" and "support_hold" share the max(c_L, c_R) state slot; "support_hold"
 # adds one more goal dimension, the *sustained-contact* feature (see HOLD_TAU).
@@ -187,6 +205,11 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
     cross = nxt(8) if goal_variant in CROSS_FAMILY else slice(i, i)
     prev_action = nxt(14)
+    # M4 "advance" block: the four relative dims are goal entries AND therefore must
+    # live in the state, plus k_ref (context for the critic) and the torque margin.
+    advance = nxt(4) if goal_variant == "advance" else slice(i, i)
+    kref = nxt(1) if goal_variant == "advance" else slice(i, i)
+    margin = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
                     *(range(hand_pos.start, hand_pos.start + 6)))
     if goal_variant == "full":
@@ -200,9 +223,13 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         # 6=c_LB1, 7=c_RB0
         pick = {"cross": (0, 1, 2, 4, 5), "cross3": (3, 4, 5), "hold2": (6, 4)}[goal_variant]
         goal_indices = tuple(cross.start + k for k in pick)
+    elif goal_variant == "advance":
+        # goal = the 4 relative dims + the torque margin (k_ref stays context)
+        goal_indices = tuple(advance.start + k for k in range(4)) + (margin.start,)
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
-                         grasp_support, hold, cross, prev_action, i, tuple(goal_indices))
+                         grasp_support, hold, cross, prev_action, advance, kref, margin,
+                         i, tuple(goal_indices))
 
 
 class Brachiation(Env):
@@ -224,6 +251,7 @@ class Brachiation(Env):
         action_window: str = "reach",        # "m1" (old, cannot express a reach) | "reach"
         goal_reach_thresh: float = 0.35,
         dwell_steps: int = 25,               # 0.5 s at 50 Hz
+        start_bar_max: int = 0,              # M4: reset on bar U{0..start_bar_max}
         naconmax: int = 16384,               # contact budget for ALL worlds (see note)
         njmax: int = 512,                    # constraint rows per world
         ls_iterations: Optional[int] = None, # None -> keep the scene XML value (20)
@@ -271,7 +299,9 @@ class Brachiation(Env):
              "position": list(_pos),
              "cross": [11, 12, 13, 15, 16],
              "cross3": [14, 15, 16],
-             "hold2": [17, 15]}[self.goal_variant],
+             "hold2": [17, 15],
+             # M4 superset tail: [.., hold(19), dx, dz, c_Lnext, c_Rnext, margin]
+             "advance": [20, 21, 22, 23, 24]}[self.goal_variant],
             dtype=jnp.int32)
         self.goal_size = int(len(self.goal_indices))
         self.goal_reach_thresh = goal_reach_thresh
@@ -289,6 +319,15 @@ class Brachiation(Env):
         self.act_scale = jnp.array(ACTION_WINDOWS[action_window], dtype=jnp.float32)
         self.hand_act = {s: jnp.array([aid(f"{s}_hand_{j}_joint") for j in FINGER_JOINTS], dtype=jnp.int32)
                          for s in ("left", "right")}
+        # M4 torque margin: the DOFs and force limits of the 12 action joints
+        # (arm + waist).  `qfrc_bias` is the gravity/Coriolis load that the
+        # actuators must carry, so 1 - |qfrc_bias|/limit is "how much actuator
+        # headroom this pose leaves" -- the CRL-language version of "battery".
+        arm_jnt = np.array([m.actuator_trnid[int(a), 0] for a in self.act_armwaist])
+        self.margin_dof = jnp.array(m.jnt_dofadr[arm_jnt], dtype=jnp.int32)
+        # NB: the G1's position actuators have forcelimited=False and forcerange=(0,0);
+        # the real limits are the *joint* actuator-force ranges.
+        self.margin_lim = jnp.array(m.jnt_actfrcrange[arm_jnt, 1], dtype=jnp.float32)
         self.wrist_body = {s: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"{s}_wrist_roll_link")
                            for s in ("left", "right")}
         # --- keyframe --------------------------------------------------------
@@ -336,11 +375,22 @@ class Brachiation(Env):
                 # stably stopped on B1 with both hands
                 "hold2": [1.0, 1.0],
             }[self.goal_variant]], dtype=jnp.float32)
+        elif self.goal_variant == "advance":
+            # ONE bar-independent goal: "hanging under the next bar with both hands,
+            # relaxed".  [dx, dz, c_Lnext, c_Rnext, margin] -- relative, so it is the
+            # same vector for every bar; `keep` selects exactly those entries.
+            self.goal_set = jnp.array([goal0[keep]], dtype=jnp.float32)
         else:
             self.goal_set = jnp.array(
                 np.stack([goal0 + k * shift for k in range(self.n_bars)])[:, keep])
         self.goal_bar = goal_bar
         self.goal_bar_min = int(goal_bar_min)
+        # Starting-bar randomisation is only meaningful for the bar-independent
+        # "advance" goal: every other variant's goal_set is pinned to absolute bar
+        # coordinates, so shifting the start would make it unreachable.
+        self.start_bar_max = int(start_bar_max)
+        if self.start_bar_max > 0 and self.goal_variant != "advance":
+            raise ValueError("start_bar_max > 0 requires goal_variant='advance'")
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -475,7 +525,7 @@ class Brachiation(Env):
                 "hold_streak": jnp.zeros(())}
 
     def _state_features(self, data, prev_action: jnp.ndarray,
-                        hold: jnp.ndarray = 0.0) -> jnp.ndarray:
+                        hold: jnp.ndarray = 0.0, kref: jnp.ndarray = 0.0) -> jnp.ndarray:
         d, w = self._grasp(data)
         dmin = d.min(axis=-1)
         c = jnp.exp(-(dmin / TAU_CONTACT) ** 2)          # soft "grasping" indicator
@@ -497,6 +547,9 @@ class Brachiation(Env):
             parts.append(cont(d[0, CROSS_TARGET])[None])    # c_LB1
             parts.append(cont(d[1, CROSS_SUPPORT])[None])   # c_RB0
         parts.append(prev_action)
+        if self.goal_variant == "advance":
+            parts.append(self._advance_features(data, kref))
+            parts.append((jnp.asarray(kref) / max(self.n_bars - 1, 1))[None])
         return jnp.concatenate(parts)
 
     def _features_numpy(self, kd, action: np.ndarray) -> np.ndarray:
@@ -521,9 +574,17 @@ class Brachiation(Env):
         # The last entry (index 19) is the sustained-contact feature.  It is history,
         # so it cannot be derived from a single `data`; for the canonical goal we use
         # the *settled* value 1.0 ("a hang that has been going on for a while").
+        # M4 tail = the GOAL vector, i.e. what `_advance_features` reads at the
+        # *target* state ("hanging under the next bar").  There dx = qpos[0] -
+        # bar_x[next] equals the keyframe's offset from ITS bar (the hang pose is
+        # the same at every bar), both contacts are 1 and dz is 0.
+        margin = 1.0 - float(np.max(np.abs(np.asarray(kd.qfrc_bias)[np.asarray(self.margin_dof)])
+                                     / np.asarray(self.margin_lim)))
+        dx_goal = float(kd.qpos[0]) - float(self.bar_x[0])
         return np.concatenate([[kd.qpos[0], kd.qpos[2]], np.concatenate(p),
                                [c, c, c], rel, [dd, cont(dd), cont(dl0), cont(dl1),
-                                                cont(dr0)], [1.0]]).astype(np.float32)
+                                                cont(dr0)], [1.0],
+                               [dx_goal, 0.0, 1.0, 1.0, margin]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -539,7 +600,8 @@ class Brachiation(Env):
             ctrl = ctrl.at[self.hand_act[s]].set(self._synergy(s, c))
         return ctrl
 
-    def _achieved_goal(self, data, hold: jnp.ndarray = 0.0) -> jnp.ndarray:
+    def _achieved_goal(self, data, hold: jnp.ndarray = 0.0,
+                       kref: jnp.ndarray = 0.0) -> jnp.ndarray:
         d, _ = self._grasp(data)
         c = jnp.exp(-(d.min(axis=-1) / TAU_CONTACT) ** 2)
         p = self._hand_points(data)
@@ -554,12 +616,47 @@ class Brachiation(Env):
             cont(d[0, CROSS_SUPPORT])[None],   # c_LB0
             cont(d[0, CROSS_TARGET])[None],    # c_LB1
             cont(d[1, CROSS_SUPPORT])[None],   # c_RB0
-            jnp.asarray(hold)[None]])          # index 19: sustained contact
+            jnp.asarray(hold)[None],           # index 19: sustained contact
+            self._advance_features(data, kref)])   # indices 20..24 (M4)
         return full[self._goal_full_idx]
 
     def _hold_feature(self, streak: jnp.ndarray) -> jnp.ndarray:
         """Consecutive gripping steps -> the sustained-contact goal entry."""
         return 1.0 - jnp.exp(-jnp.asarray(streak) / HOLD_TAU)
+
+    def _margin(self, data) -> jnp.ndarray:
+        """Actuator headroom of the 12 arm/waist joints: 1 - max|qfrc_bias|/limit."""
+        load = jnp.abs(data.qfrc_bias[self.margin_dof]) / self.margin_lim
+        return jnp.clip(1.0 - jnp.max(load), 0.0, 1.0)
+
+    def _advance_features(self, data, kref) -> jnp.ndarray:
+        """[dx, dz, c_L,next, c_R,next, margin] relative to bar k_ref+1.
+
+        Translation invariant (dx/dz are differences) and progress invariant (the
+        reference bar travels with the robot), so one goal covers every bar.
+        """
+        d, _ = self._grasp(data)
+        k = jnp.clip(jnp.asarray(kref) + 1.0, 0.0, self.n_bars - 1).astype(jnp.int32)
+        x_bar = jnp.take(self.bar_x, k)
+        dx = data.qpos[0] - x_bar
+        dz = data.qpos[2] - self.key_qpos[2]
+        c_next = jnp.exp(-(d[:, k] / TAU_CONTACT) ** 2)
+        return jnp.concatenate([dx[None], dz[None], c_next, self._margin(data)[None]])
+
+    def episode_info_zero(self):
+        """Reset values of the episode-scoped `info` entries at t=0.
+
+        Two users: ``reset()`` and ``MjxAutoResetWrapper`` (brax's auto-reset only
+        swaps ``pipeline_state``/``obs``, so without this the counters below kept
+        their values across episode boundaries, e.g. `cov_b1_runmax` could exceed
+        the number of double-support steps in the same episode).
+        """
+        return {"max_bar": jnp.zeros(()), "dwell": jnp.zeros(()),
+                "prev_bar": jnp.full((2,), -1.0), "switches_total": jnp.zeros(()),
+                "k_ref": jnp.zeros(()), "k_ref_run": jnp.zeros(()),
+                "k_ref_run_bar": jnp.full((), -1.0),
+                "kref_max": jnp.zeros(()),
+                **self._cov_zero_info()}
 
     # ------------------------------------------------------------------ #
     # brax Env interface
@@ -577,6 +674,11 @@ class Brachiation(Env):
                           jax.random.uniform(rng_leg, (self.njoints,), minval=-nl, maxval=nl),
                           jax.random.uniform(rng_arm, (self.njoints,), minval=-na, maxval=na))
         qpos = qpos.at[:3].add(root).at[7:].add(noise)
+        if self.start_bar_max > 0:
+            # The bars are periodic, so "start on bar k" is just a translation of the
+            # whole robot by k * spacing -- bit-identical physics, no new asset.
+            k0 = jax.random.randint(rng_goal, (), 0, self.start_bar_max + 1).astype(jnp.float32)
+            qpos = qpos.at[0].add(k0 * self.bar_spacing)
         qvel = nv * jax.random.normal(rng_vel, (self.mj_model.nv,))
 
         data = self._data0.replace(qpos=qpos, qvel=qvel, ctrl=self.key_ctrl)
@@ -596,18 +698,16 @@ class Brachiation(Env):
         # though both hands are gripping B0 the sustained-contact entry is 0 here
         # and only rises over the next few steps (see HOLD_TAU).
         obs = jnp.concatenate(
-            [self._state_features(data, jnp.zeros(14), self._hold_feature(0.0)), goal])
+            [self._state_features(data, jnp.zeros(14), self._hold_feature(0.0), 0.0), goal])
         # JaxGCRL's evaluator hardcodes these five names:
         #   reward, success, success_easy, dist, distance_from_origin
         # (see jaxgcrl/utils/evaluator.py).  Everything else is our own.
         metrics = {k: jnp.zeros(()) for k in
                    ("reward", "success", "success_easy", "dist", "distance_from_origin",
                     "dwell_success", "max_bar", "bar_L", "bar_R", "hand_switches",
-                    "fell", "forward")}
+                    "fell", "forward", "kref_max")}
         metrics.update(self._cov_zero_metrics())
-        info = {"goal": goal, "max_bar": jnp.zeros(()), "dwell": jnp.zeros(()),
-                "prev_bar": jnp.full((2,), -1.0), "switches_total": jnp.zeros(())}
-        info.update(self._cov_zero_info())
+        info = {"goal": goal, **self.episode_info_zero()}
         return State(pipeline_state=data, obs=obs, reward=jnp.zeros(()), done=jnp.zeros(()),
                      metrics=metrics, info=info)
 
@@ -633,11 +733,24 @@ class Brachiation(Env):
         hold_streak = jnp.where(gripping > 0, state.info["hold_streak"] + 1.0, 0.0)
         hold = self._hold_feature(hold_streak)
 
-        feats = self._state_features(data, action, hold)
+        # --- M4 progress index: the bar of the last *sustained* grip -----------
+        # `bar` is per hand, >= 0 only inside the 5 cm grasp window; a grip must last
+        # K_SUSTAIN steps before it advances the reference bar, so grazing the next
+        # bar in passing does not count as progress.
+        k_now = jnp.max(bar)
+        same = (k_now == state.info["k_ref_run_bar"]) & (k_now >= 0)
+        k_run = jnp.where(same, state.info["k_ref_run"] + 1.0,
+                          jnp.where(k_now >= 0, 1.0, 0.0))
+        k_run_bar = jnp.where(same, state.info["k_ref_run_bar"], k_now)
+        k_ref = jnp.where((k_run >= K_SUSTAIN) & (k_run_bar > state.info["k_ref"]),
+                          k_run_bar, state.info["k_ref"])
+        kref_max = jnp.maximum(state.info["kref_max"], k_ref)
+
+        feats = self._state_features(data, action, hold, k_ref)
         goal = state.info["goal"]
         obs = jnp.concatenate([feats, goal])
 
-        achieved = self._achieved_goal(data, hold)
+        achieved = self._achieved_goal(data, hold, k_ref)
         dist = jnp.linalg.norm(achieved - goal)
         success = (dist < self.goal_reach_thresh).astype(jnp.float32)
         slow = jnp.linalg.norm(data.qvel) < 1.0
@@ -663,6 +776,9 @@ class Brachiation(Env):
             # the running total lives in info["switches_total"]
             hand_switches=switched.astype(jnp.float32),
             fell=fell,
+            # M4 headline: furthest bar index with a SUSTAINED grip this episode
+            # (0 = never left the start bar, 1 = advanced one bar, ...)
+            kref_max=kref_max,
         )
         # NB: carry the existing info/metrics dicts forward — JaxGCRL's
         # TrajectoryIdWrapper and brax's EpisodeWrapper add keys (traj_id, steps,
@@ -677,6 +793,8 @@ class Brachiation(Env):
         # revert a running counter to its previous value.
         info.update(goal=goal, max_bar=max_bar, dwell=dwell, prev_bar=bar,
                     hold_streak=hold_streak,
+                    k_ref=k_ref, k_ref_run=k_run, k_ref_run_bar=k_run_bar,
+                    kref_max=kref_max,
                     switches_total=(state.info.get("switches_total", jnp.zeros(()))
                                     + switched.astype(jnp.float32)))
         return State(pipeline_state=data, obs=obs, reward=jnp.zeros(()), done=fell,

@@ -1834,3 +1834,81 @@ obs 153 ⇒ **与旧 checkpoint 不兼容**（新跑，不能续训）。
 `--smoke` 仍然是**接线测试**（能验 obs/goal 维度、指标键、checkpoint 落盘），但**不能当数值健康检查**。
 
 顺带加了一个 **NaN 守卫**：连续 3 个 eval 的 `critic_loss`/`actor_loss`/`logits_pos` 出现 nan 就打印并 `SystemExit(2)`（保留已写出的 checkpoint），免得 1.5 h 的 GPU run 白跑。
+
+## 9.35 M4.0：平移不变的"推进一根杆"目标（`--goal-variant advance`）
+
+### 9.35.1 run #11（`support_hold`）的结论 + 行为逐步分解
+
+20 个 eval，12,197,632 步（`runs/brach_hold_b1/`，git `af945f8`）。**`hold` 一加进去效果就变了**：
+
+| steps | len | fell | C(0.1) | 最近距离 | 摆幅 | b1 双持步数 | 离杆最长 | bar_L | bar_R | succ | dist |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.94 M | 501 | 0% | 0.00 | 0.272 | 0.067 | — | 0 | −481 | −496 | 0 | 731 |
+| 6.77 M | 59.6 | 100% | 1.00 | 0.010 | 0.314 | 11.1 | 14.4 | −25 | −27 | 3.2 | 65 |
+| 7.98 M | 190.8 | 81% | 1.00 | 0.003 | 0.533 | 66.9 | 16.0 | +38.8 | +10.8 | 55.3 | 131 |
+| **11.59 M** | **367.6** | **31%** | 1.00 | 0.005 | 0.451 | **130.6** | 18.9 | **+270.9** | −104.3 | **178.2** | 188 |
+| 12.20 M | 306.2 | 44% | 1.00 | 0.008 | 0.420 | 95.4 | 16.1 | +222.5 | −115.2 | 108.1 | 175 |
+
+指标一路在涨、**没有平台**（len 190→368，succ 55→178）。把最终 checkpoint 在 CPU 上回放（`runs/render/hold_final/`，3 集 × 400 步）：
+
+| 集 | 掉落@ | 左手在 B1 步数 | 右手在 B1 步数 | 双持最长 | 双手同时（任意杆）最长 | 离杆最长 |
+|---|---|---|---|---|---|---|
+| 0 | 45 | 24 | 5 | 2 | 4 | 357 |
+| 1 | 未掉 | **349 / 400** | **133** | **52** | 52 | 18 |
+| 2 | 43 | 13 | 15 | 7 | 366→（掉落） | 366 |
+
+逐步过程：**①** 双手挂 B0 → **②** 松手鱼跃 0.2 s（和 run #10 一样）→ **③** 到 B1 时**两手都曾摸到**（如 ep0 step 21：`d_LB1=0.010, d_RB1=0.015`，`barL=barR=1`）→ **④** 右手 3 步内滑脱，**左手单独拽住 B1** → **⑤** 身体绕左手继续前摆，有时能保持 300+ 步（ep1），有时 B1 也滑脱就掉（ep0/2）。
+
+### 9.35.2 是 goal 的问题还是步数的问题？——**goal 是绑定约束**
+
+- **不是够不到**：右手确实摸到了 B1（15 mm，`barR=1`），说明手臂可达、动作窗够大。
+- **是 goal 没有"要求"它留下**：`support_hold` 的接触项是 `max(c_L,c_R)`、`hold` 是"**至少一只手**在窗内"。左手一拽住 B1，这两项就都满分了 ⇒ 只剩 `p_R`(3/10 维) 在推右手，而它已经能达到（瞬时）。
+- **更糟的是 self-curriculum 会把它锁死**：CRL 的训练目标是**策略自己未来帧的状态**（§1 C3）。一旦"左手拽住、右手悬着"成为多数未来状态，重标记出来的 goal 就大多是这种状态 ⇒ 策略被推向"完美地单手吊着"，而不是"把另一只手也放上去"。这是典型的 CRL 侧吸引子。
+- **步数确实也没跑完**：指标到 12.2 M 仍在涨（没有任何平台迹象），所以再跑 4 h 会更好——但**在同一个侧吸引子里更好**（单手吊得更稳），不会自己长出第二只手。⇒ 要解决"第二只手"，必须让 goal 对它提要求；**M4 的目标形式正好天然满足这一点**（下一条）。
+
+### 9.35.3 `advance` 目标：一根杆的"平移不变"目标（M4 的地基）
+
+$$g=\big[\underbrace{x_{\rm com}-x_{B_{k+1}}}_{\Delta x},\;\underbrace{z_{\rm com}-z_{\rm hang}}_{\Delta z},\;c_{L,B_{k+1}},\;c_{R,B_{k+1}},\;\underbrace{1-\max_j\frac{|q_{{\rm bias},j}|}{\tau_j^{\max}}}_{\text{margin}}\big]\quad(5\ \text{维})$$
+
+- `k_ref` = **最近一次"持续抓稳"（连续 ≥ `K_SUSTAIN=3` 步在 5 cm 窗内）的杆号**，存在 `info` 里（进 obs 作上下文，**不进 goal**）⇒ 滞空期间 `k_ref` 不动，"下一根杆"始终有定义，**鱼跃仍然可以表达**。
+- 平移不变（Δx/Δz 都是差）+ 进度不变（参考杆跟着走）⇒ **同一个 goal 在每一根杆上都成立**。实测：从 B0 或 B1 出发，初始 `dist` 都是 **1.456** ✓
+- **两只手的接触项分别针对"下一根杆"** ⇒ 单手（无论哪只）只能把 `dist` 压到 ~1.0，**单手解不再是目标状态** ⇒ 9.35.2 的侧吸引子被结构性消除（这是 `advance` 相对 `support_hold` 的关键差别）。
+- `margin`（用户提的"留电量"）= 12 个臂/腰关节的**力矩余量**，纯状态函数（`qfrc_bias` / `jnt_actfrcrange`）。关键帧悬挂时 margin = **0.854**（还剩 85% 余量），勉强抓住/撑住时会掉下来 ⇒ 不限制策略，只改变"什么算好终点"。
+
+**CPU 校验（全部通过）**：
+
+| 检查 | 结果 |
+|---|---|
+| 布局 | `state=147 / goal=5 / obs=152`，`goal_indices=(141,142,143,144,146)` |
+| goal_set | 只有一行 = `[−0.071, 0, 1, 1, 0.854]`（相对量，与杆号无关）|
+| 平移不变 | 起点随机在 B0/B1 时初始 `dist` = 1.4559 / 1.4572 ✓ |
+| **到位** | 把机器人挪到 B1 的悬挂位姿 → `dist` = **0.040 / 0.020**（≪ 0.35 = success）|
+| **推进后重定向** | 持续抓稳 3 步后 `k_ref: 0→1`，goal 指向 B2，`dist` 回到 1.457 ✓（连续过多杆的自我课程就是这么来的）|
+| 事件级 info 复位 | 用 `brax_ext.wrap` 强制掉落：`max_bar/k_ref/kref_max/cov_b1_runmax` 均回到 0，`cov_min_d_b1` 回到 2.0 ✓ |
+
+### 9.35.4 顺带修掉的第二个指标 bug：`info` 里的计数器从不跨 episode 复位
+
+brax 的 `AutoResetWrapper` 只换 `pipeline_state`/`obs`，**不碰 `info`** ⇒ 我们放在 `info` 里的所有计数器（`max_bar`、`dwell`、`hold`/`k_ref`、覆盖率 tracker）在掉落重生后**继续累加**。证据：run #11 的 `cov_b1_runmax`(全窗口最长双持段) 一度 **大于** `cov_both_on_steps`(同窗口双持步数)——这在数学上不可能。
+
+修法：env 新增 `episode_info_zero()`（t=0 值，`reset()` 与包装器共用），`MjxAutoResetWrapper` 在 `done` 的环境上按 per-env mask 复位这些键。现在 `max_bar`/`dwell`/`dwell_success`/`kref_max` 都是**真正的 per-episode** 量。`src/check_metrics.py` 也加了第四道检查：`step()` 写入的 metrics 键必须在 `reset()` 里零初始化（`kref_max` 就是被这条抓出来的——它第一次跑就被 `EpisodeWrapper` 的 scan 结构检查拒绝）。
+
+### 9.35.5 run #12 命令（M4.0，1.5 h）
+
+```bash
+.venv-warp/bin/python src/check_args.py && .venv-warp/bin/python src/check_metrics.py
+
+.venv-warp/bin/python src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant advance --start-bar-max 1 \
+  --expl-hold 10 --num-evals 20 --steps 12200000 \
+  --checkpoint-dir runs/ckpt_adv --save-every 5 \
+  --impl warp --scene full035 --wandb --exp-name brach_adv_b1
+```
+
+（`--goal-variant advance` 是**单指令目标**，`--train-goal-bar/--eval-goal-bar` 被忽略，同 cross 家族；`--start-bar-max 1` = 从 B0 或 B1 出发各半。）
+
+| 现象 | 判读 | 下一步 |
+|---|---|---|
+| `kref_max` 停在 0、`len` 掉回 40–70 | 目标太严（要两只手同时），策略退回鱼跃 | 先加 `--entropy-param 1.6` 降噪；或退回"`hold` 用双手判据"的单杆版本 |
+| `kref_max` = 1 出现、`len` ≥ 200 | 能推进一根杆且稳定（M4.0 达成） | 跑满 4 h 看 $P(\ge 2)$ |
+| `kref_max` ≥ 2 | 已经连续过多杆 | 直接进 M4.3（9 根杆 + lap 统计） |
