@@ -301,6 +301,15 @@ def main() -> int:
     eval_kwargs = dict(env_kwargs)
     if not is_cross:
         eval_kwargs["goal_bar"] = None if args.eval_goal_bar < 0 else args.eval_goal_bar
+    # The evaluation must stay a FIXED probe so `eval/*` is comparable across evals
+    # and across runs: always start on bar 0, and drop the forward-only goal sampling
+    # when the goal bar is pinned (goal_ahead requires a sampled goal bar).  With
+    # `--eval-goal-bar 4` this makes the probe "from B0, traverse to B4", i.e. a clean
+    # multi-bar readout (`advance_max` = bars actually advanced in that probe), while
+    # the *training* distribution keeps the randomised start + forward goal.
+    eval_kwargs["start_bar_max"] = 0
+    if eval_kwargs.get("goal_bar") is not None:
+        eval_kwargs["goal_ahead"] = False
     # Warp's naconmax is a GLOBAL budget, so the eval env must scale it by ITS OWN
     # world count -- sharing the training value (128 x 128 = 16384) with only 16
     # eval worlds wasted 8x the contact memory and was what ran the 8 GB card out
