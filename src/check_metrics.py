@@ -92,6 +92,10 @@ def main() -> int:
     reset_fn = _find(cls, "reset", ast.FunctionDef)
     zero_step = {n.value for n in ast.walk(reset_fn)
                  if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    # reset() delegates to these two, so their literals count as zero-init too
+    for fn in ("episode_info_zero", "_cov_zero_info"):
+        zero_step |= {n.value for n in ast.walk(_find(cls, fn, ast.FunctionDef))
+                      if isinstance(n, ast.Constant) and isinstance(n.value, str)}
     step_writes = set()
     for call in ast.walk(step):
         if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
@@ -125,7 +129,8 @@ def main() -> int:
         if k not in zero_i and not k.startswith(("goal", "dwell", "prev_bar",
                                                  "max_bar", "switches_total",
                                                  "hold_streak", "k_ref", "k_ref_run",
-                                                 "k_ref_run_bar", "kref_max")):
+                                                 "k_ref_run_bar", "kref_max",
+                                                 "next_streak")):
             problems.append(f"info[{k!r}] read but not in _cov_zero_info")
 
     print(f"metrics emitted by _coverage : {len(emitted)}")

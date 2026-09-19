@@ -121,7 +121,23 @@ GOAL_VARIANTS = ("full", "support", "support_hold", "position", "cross", "cross3
 # per-hand and target specific -- that is also what removes the one-handed
 # attractor of `support`/`support_hold`, where max(c_L,c_R) was satisfied by one
 # hand alone).
-K_SUSTAIN = 3           # steps a grip must last before it advances `k_ref`
+# A grip must last this long before it counts as having advanced k_ref.  It is the
+# knob that couples the "arrive and STAY" pressure to the self-curriculum: the goal
+# keeps pointing at the bar just grabbed until k_ref advances, so a longer gate
+# means (a) more steps for `hold_next` to build (at 25 steps it reaches 0.92, i.e.
+# `success` becomes reachable) and (b) the goal only moves on once the robot really
+# is hanging there.  Set equal to the env's own dwell_steps (0.5 s).
+K_SUSTAIN = 25
+
+# Kernel width for the *contact with the next bar* entries of the `advance` goal.
+# Chosen so that the soft contact is exactly 0.5 at the env's own grasp criterion
+# (d = GRASP_THRESH = 5 cm): tau = 0.05 / sqrt(ln 2) = 0.0601.  The generic
+# TAU_CONTACT = 0.04 puts the 0.5 point at 3.3 cm -- *inside* the envelope -- so a
+# settled hang (the grasp point drifts out to 3-4.5 cm, see HOLD_TAU) would read
+# only ~0.55 and the goal would be unreachable by construction.  Only the advance
+# entries use this; every older variant keeps TAU_CONTACT so run #7-#11 stay
+# comparable.
+TAU_NEXT = GRASP_THRESH / float(np.sqrt(np.log(2.0)))
 
 
 # "support" and "support_hold" share the max(c_L, c_R) state slot; "support_hold"
@@ -207,7 +223,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     prev_action = nxt(14)
     # M4 "advance" block: the four relative dims are goal entries AND therefore must
     # live in the state, plus k_ref (context for the critic) and the torque margin.
-    advance = nxt(4) if goal_variant == "advance" else slice(i, i)
+    advance = nxt(5) if goal_variant == "advance" else slice(i, i)
     kref = nxt(1) if goal_variant == "advance" else slice(i, i)
     margin = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
@@ -224,8 +240,9 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         pick = {"cross": (0, 1, 2, 4, 5), "cross3": (3, 4, 5), "hold2": (6, 4)}[goal_variant]
         goal_indices = tuple(cross.start + k for k in pick)
     elif goal_variant == "advance":
-        # goal = the 4 relative dims + the torque margin (k_ref stays context)
-        goal_indices = tuple(advance.start + k for k in range(4)) + (margin.start,)
+        # goal = [dx, dz, c_L,next, c_R,next, hold_next] + the torque margin
+        # (k_ref stays context: it is progress, not a target)
+        goal_indices = tuple(advance.start + k for k in range(5)) + (margin.start,)
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
                          grasp_support, hold, cross, prev_action, advance, kref, margin,
@@ -300,8 +317,9 @@ class Brachiation(Env):
              "cross": [11, 12, 13, 15, 16],
              "cross3": [14, 15, 16],
              "hold2": [17, 15],
-             # M4 superset tail: [.., hold(19), dx, dz, c_Lnext, c_Rnext, margin]
-             "advance": [20, 21, 22, 23, 24]}[self.goal_variant],
+             # M4 superset tail: [.., hold(19), dx, dz, c_Lnext, c_Rnext,
+             #                    hold_next, margin]
+             "advance": [20, 21, 22, 23, 24, 25]}[self.goal_variant],
             dtype=jnp.int32)
         self.goal_size = int(len(self.goal_indices))
         self.goal_reach_thresh = goal_reach_thresh
@@ -548,7 +566,7 @@ class Brachiation(Env):
             parts.append(cont(d[1, CROSS_SUPPORT])[None])   # c_RB0
         parts.append(prev_action)
         if self.goal_variant == "advance":
-            parts.append(self._advance_features(data, kref))
+            parts.append(self._advance_features(data, kref, hold))
             parts.append((jnp.asarray(kref) / max(self.n_bars - 1, 1))[None])
         return jnp.concatenate(parts)
 
@@ -575,16 +593,17 @@ class Brachiation(Env):
         # so it cannot be derived from a single `data`; for the canonical goal we use
         # the *settled* value 1.0 ("a hang that has been going on for a while").
         # M4 tail = the GOAL vector, i.e. what `_advance_features` reads at the
-        # *target* state ("hanging under the next bar").  There dx = qpos[0] -
-        # bar_x[next] equals the keyframe's offset from ITS bar (the hang pose is
-        # the same at every bar), both contacts are 1 and dz is 0.
+        # *target* state ("hanging under the next bar, and staying there").  There
+        # dx = qpos[0] - bar_x[next] equals the keyframe's offset from ITS bar (the
+        # hang pose is the same at every bar), both contacts are 1, dz is 0 and the
+        # sustained-contact entry is 1 (a settled hang).
         margin = 1.0 - float(np.max(np.abs(np.asarray(kd.qfrc_bias)[np.asarray(self.margin_dof)])
                                      / np.asarray(self.margin_lim)))
         dx_goal = float(kd.qpos[0]) - float(self.bar_x[0])
         return np.concatenate([[kd.qpos[0], kd.qpos[2]], np.concatenate(p),
                                [c, c, c], rel, [dd, cont(dd), cont(dl0), cont(dl1),
                                                 cont(dr0)], [1.0],
-                               [dx_goal, 0.0, 1.0, 1.0, margin]]).astype(np.float32)
+                               [dx_goal, 0.0, 1.0, 1.0, 1.0, margin]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -602,6 +621,10 @@ class Brachiation(Env):
 
     def _achieved_goal(self, data, hold: jnp.ndarray = 0.0,
                        kref: jnp.ndarray = 0.0) -> jnp.ndarray:
+        # `hold` means "the sustained-contact scalar this variant uses":
+        #   support_hold -> at least one hand on ANY bar
+        #   advance      -> at least one hand on the NEXT bar
+        # (see the streak bookkeeping in step()).
         d, _ = self._grasp(data)
         c = jnp.exp(-(d.min(axis=-1) / TAU_CONTACT) ** 2)
         p = self._hand_points(data)
@@ -617,7 +640,7 @@ class Brachiation(Env):
             cont(d[0, CROSS_TARGET])[None],    # c_LB1
             cont(d[1, CROSS_SUPPORT])[None],   # c_RB0
             jnp.asarray(hold)[None],           # index 19: sustained contact
-            self._advance_features(data, kref)])   # indices 20..24 (M4)
+            self._advance_features(data, kref, hold)])   # indices 20..25 (M4)
         return full[self._goal_full_idx]
 
     def _hold_feature(self, streak: jnp.ndarray) -> jnp.ndarray:
@@ -629,19 +652,27 @@ class Brachiation(Env):
         load = jnp.abs(data.qfrc_bias[self.margin_dof]) / self.margin_lim
         return jnp.clip(1.0 - jnp.max(load), 0.0, 1.0)
 
-    def _advance_features(self, data, kref) -> jnp.ndarray:
-        """[dx, dz, c_L,next, c_R,next, margin] relative to bar k_ref+1.
+    def _advance_features(self, data, kref, hold_next=0.0) -> jnp.ndarray:
+        """[dx, dz, c_L,next, c_R,next, hold_next, margin] relative to bar k_ref+1.
 
         Translation invariant (dx/dz are differences) and progress invariant (the
         reference bar travels with the robot), so one goal covers every bar.
+
+        `hold_next` is the M4 analogue of the M3 `hold` term that run #11 showed to
+        be essential: the two contact entries above are *instantaneous*, so without
+        it a ballistic pass through "under the next bar, both hands touching it"
+        would satisfy the goal for a few frames (exactly the exploit that made run
+        #10 graze instead of grasp).  `hold_next` only rises while a hand stays in
+        the next bar's window, so the target state is "arrived AND stayed".
         """
         d, _ = self._grasp(data)
         k = jnp.clip(jnp.asarray(kref) + 1.0, 0.0, self.n_bars - 1).astype(jnp.int32)
         x_bar = jnp.take(self.bar_x, k)
         dx = data.qpos[0] - x_bar
         dz = data.qpos[2] - self.key_qpos[2]
-        c_next = jnp.exp(-(d[:, k] / TAU_CONTACT) ** 2)
-        return jnp.concatenate([dx[None], dz[None], c_next, self._margin(data)[None]])
+        c_next = jnp.exp(-(d[:, k] / TAU_NEXT) ** 2)
+        return jnp.concatenate([dx[None], dz[None], c_next,
+                                jnp.asarray(hold_next)[None], self._margin(data)[None]])
 
     def episode_info_zero(self):
         """Reset values of the episode-scoped `info` entries at t=0.
@@ -656,6 +687,7 @@ class Brachiation(Env):
                 "k_ref": jnp.zeros(()), "k_ref_run": jnp.zeros(()),
                 "k_ref_run_bar": jnp.full((), -1.0),
                 "kref_max": jnp.zeros(()),
+                "next_streak": jnp.zeros(()),
                 **self._cov_zero_info()}
 
     # ------------------------------------------------------------------ #
@@ -723,16 +755,6 @@ class Brachiation(Env):
         c = jnp.exp(-(dmin / TAU_CONTACT) ** 2)
         bar = jnp.where(dmin < GRASP_THRESH, jnp.argmax(w, axis=-1).astype(jnp.float32), -1.0)
 
-        # sustained contact: consecutive steps with at least one hand inside the
-        # grasp window of some bar (dmin < GRASP_THRESH -- the same criterion as
-        # `bar_L`/`bar_R`/`max_bar`, NOT the tighter `max(c) > 0.5` of _coverage:
-        # a *settled* hang sits at dmin ~3.5-4.5 cm, so max(c) > 0.5 would call a
-        # validated hang "not gripping").  The streak resets the moment no hand is
-        # in any window, which is exactly what a ballistic dive does.
-        gripping = (jnp.min(d) < GRASP_THRESH).astype(jnp.float32)
-        hold_streak = jnp.where(gripping > 0, state.info["hold_streak"] + 1.0, 0.0)
-        hold = self._hold_feature(hold_streak)
-
         # --- M4 progress index: the bar of the last *sustained* grip -----------
         # `bar` is per hand, >= 0 only inside the 5 cm grasp window; a grip must last
         # K_SUSTAIN steps before it advances the reference bar, so grazing the next
@@ -745,6 +767,24 @@ class Brachiation(Env):
         k_ref = jnp.where((k_run >= K_SUSTAIN) & (k_run_bar > state.info["k_ref"]),
                           k_run_bar, state.info["k_ref"])
         kref_max = jnp.maximum(state.info["kref_max"], k_ref)
+
+        # sustained contact: consecutive steps with at least one hand inside the
+        # grasp window of some bar (dmin < GRASP_THRESH -- the same criterion as
+        # `bar_L`/`bar_R`/`max_bar`, NOT the tighter `max(c) > 0.5` of _coverage:
+        # a *settled* hang sits at dmin ~3.5-4.5 cm, so max(c) > 0.5 would call a
+        # validated hang "not gripping").  The streak resets the moment no hand is
+        # in any window, which is exactly what a ballistic dive does.
+        gripping = (jnp.min(d) < GRASP_THRESH).astype(jnp.float32)
+        hold_streak = jnp.where(gripping > 0, state.info["hold_streak"] + 1.0, 0.0)
+        # M4: the same idea, but only for the bar the robot is advancing TO.  It has
+        # to be k_ref + 1 (the bar the goal currently points at), NOT "the bar a hand
+        # is on" -- otherwise the streak tracks the wrong bar the moment the robot
+        # arrives, and hold_next never builds.
+        k_next = jnp.clip(k_ref + 1.0, 0.0, self.n_bars - 1).astype(jnp.int32)
+        on_next = (jnp.min(d[:, k_next]) < GRASP_THRESH).astype(jnp.float32)
+        next_streak = jnp.where(on_next > 0, state.info["next_streak"] + 1.0, 0.0)
+        hold = (self._hold_feature(next_streak) if self.goal_variant == "advance"
+                else self._hold_feature(hold_streak))
 
         feats = self._state_features(data, action, hold, k_ref)
         goal = state.info["goal"]
@@ -792,7 +832,7 @@ class Brachiation(Env):
         # ... and apply the authoritative values LAST, so no later update can
         # revert a running counter to its previous value.
         info.update(goal=goal, max_bar=max_bar, dwell=dwell, prev_bar=bar,
-                    hold_streak=hold_streak,
+                    hold_streak=hold_streak, next_streak=next_streak,
                     k_ref=k_ref, k_ref_run=k_run, k_ref_run_bar=k_run_bar,
                     kref_max=kref_max,
                     switches_total=(state.info.get("switches_total", jnp.zeros(()))
