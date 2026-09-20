@@ -1,0 +1,8 @@
+# Unitree G1 source XMLs used to build the scenes (google-deepmind/mujoco_menagerie,
+# directory unitree_g1).  The directory itself is NOT tracked (38 MB); fetch it and
+# verify with:  sha256sum -c assets/g1_brachiation/menagerie_sha256.txt
+7bf99a486bc3d4f24629dd5ccae30b7c9c3ad595d84e685fbd1e4920d457a61f  unitree_g1/g1_mjx.xml
+2d41a3c6783fbf9e17349608d9c2222d970163b1db315ce9f30c4a97631fc078  unitree_g1/g1_with_hands.xml
+3c2616550a31f33e84d3c80b8e913ac5618c8888019b0c9490dae93493e647f3  unitree_g1/g1.xml
+69a995bc8f8ba05de416de0944635e386f0581a82ce8cf2bbe3f50d4bd64e812  unitree_g1/scene_with_hands.xml
+e3f3a82afba68e1fbf6546d0d8ec1c9896d7c5117d7f9e2171f2dccd5740f80b  unitree_g1/scene.xml
