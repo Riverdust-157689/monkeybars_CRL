@@ -1,42 +1,54 @@
 #!/usr/bin/env bash
-# Regenerate patches/jaxgcrl_crl_losses.patch from the pinned upstream checkout.
+# Regenerate / verify patches/jaxgcrl_crl_losses.patch -- the single source of truth
+# for our delta against upstream JaxGCRL (see third_party/jaxgcrl/PROVENANCE.md).
 #
-# third_party/jaxgcrl is a *shallow clone* of MichalBortkiewicz/JaxGCRL (pinned
-# commit, see docs/M2_JaxGCRL接入记录.md).  The root repo ignores third_party/, so
-# the only versioned record of our edits to it is this patch file -- which means
-# it MUST be regenerated and verified every time jaxgcrl is touched.  (It went
-# stale once: the evaluator metric whitelist grew after the patch was written.)
+# Two layouts are supported:
+#   * vendored  : third_party/jaxgcrl/ holds the patched sources (tracked, no .git)
+#                 and the upstream object database sits in
+#                 .scratch/jaxgcrl_upstream_git/  (ignored)
+#   * checkout  : third_party/jaxgcrl/ is a real git clone of upstream that has the
+#                 patch applied in its working tree
 #
 # Usage:  tools/make_patch.sh [--check]
-#   (no args)  regenerate the patch and verify it reverse-applies to the tree
-#   --check    verify only (fails if the patch would not reproduce the tree)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JAXGCRL="$REPO/third_party/jaxgcrl"
+TREE="$REPO/third_party/jaxgcrl"
 PATCH="$REPO/patches/jaxgcrl_crl_losses.patch"
 
-if [ ! -d "$JAXGCRL/.git" ]; then
-    echo "third_party/jaxgcrl is the VENDORED tree (no .git): nothing to regenerate."
-    echo "Re-sync procedure (third_party/jaxgcrl/PROVENANCE.md):"
-    echo "  tmp=\$(mktemp -d); git clone https://github.com/MichalBortkiewicz/JaxGCRL \$tmp/j"
-    echo "  git -C \$tmp/j checkout 5a6e7a0 && git -C \$tmp/j apply \$PWD/patches/jaxgcrl_crl_losses.patch"
-    echo "  diff -r --exclude=assets --exclude=__pycache__ \$tmp/j/jaxgcrl third_party/jaxgcrl/jaxgcrl"
+if [ -d "$TREE/.git" ]; then
+    GIT=(git -C "$TREE")
+elif [ -d "$REPO/.scratch/jaxgcrl_upstream_git" ]; then
+    GIT=(git --git-dir="$REPO/.scratch/jaxgcrl_upstream_git" --work-tree="$TREE")
+else
+    cat <<'MSG'
+no upstream object database found (neither third_party/jaxgcrl/.git nor
+.scratch/jaxgcrl_upstream_git).  The vendored tree is still usable at runtime;
+to regenerate the patch, re-create the checkout:
+  tmp=$(mktemp -d); git clone https://github.com/MichalBortkiewicz/JaxGCRL $tmp/j
+  git -C $tmp/j checkout 5a6e7a0
+  mv $tmp/j/.git .scratch/jaxgcrl_upstream_git
+MSG
     exit 0
 fi
 
-if [ "${1:-}" != "--check" ]; then
-    git -C "$JAXGCRL" diff > "$PATCH"
-    echo "wrote $PATCH ($(wc -l < "$PATCH") lines)"
-fi
+current="$(mktemp)"
+"${GIT[@]}" diff -- jaxgcrl > "$current"
 
-echo "upstream HEAD : $(git -C "$JAXGCRL" rev-parse --short HEAD)"
+echo "upstream HEAD : $("${GIT[@]}" rev-parse --short HEAD)"
 echo "modified files:"
-git -C "$JAXGCRL" diff --name-only | sed 's/^/  /'
+"${GIT[@]}" diff --name-only -- jaxgcrl | sed 's/^/  /'
 
-if git -C "$JAXGCRL" apply -R --check "$PATCH" 2>/dev/null; then
-    echo "OK  patch reproduces the working tree exactly"
-else
-    echo "FAIL patch does NOT reverse-apply -- regenerate before committing"
-    exit 1
+if [ "${1:-}" = "--check" ]; then
+    if diff -q "$current" "$PATCH" >/dev/null; then
+        echo "OK  patches/ is byte-identical to the current working tree delta"
+        rm -f "$current"; exit 0
+    fi
+    echo "FAIL patches/ is STALE -- regenerate (run without --check).  First lines of the drift:"
+    diff "$current" "$PATCH" | head -12 || true
+    rm -f "$current"; exit 1
 fi
+
+mv "$current" "$PATCH"
+echo "wrote $PATCH ($(wc -l < "$PATCH") lines)"
+diff -q <("${GIT[@]}" diff -- jaxgcrl) "$PATCH" >/dev/null && echo "OK  patch matches the working tree delta"
