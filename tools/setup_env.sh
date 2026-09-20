@@ -95,9 +95,29 @@ MSG
         exit 1
     fi
 fi
-( cd assets/g1_brachiation && sha256sum -c menagerie_sha256.txt ) || {
-    echo "!! menagerie hashes differ from the ones this repo was built with"
-    echo "!! (upstream changed).  Pin an older commit or expect scene changes."; }
+# Two different things can drift, with very different consequences:
+#   * the MESH subtree  -> changes the physics (the tracked scene_bars*.xml only
+#     references these files) => must match, otherwise results are not comparable;
+#   * the upstream XMLs -> only used when REBUILDING the scene from source, so a
+#     mismatch there is a warning (the tracked scene XML is what actually runs).
+ASSETS_HASH_EXPECT=ccd11011746f55d2b2d5dbd4eab63d9c46ce1a4d33b4d9dda5ad7b8e8b053574
+assets_hash=$( cd assets/g1_brachiation/menagerie/unitree_g1 \
+    && find assets -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 )
+if [ "$assets_hash" != "$ASSETS_HASH_EXPECT" ]; then
+    cat <<MSG
+!! the MESH subtree differs from the one this repo was built with:
+!!   expected $ASSETS_HASH_EXPECT
+!!   got      $assets_hash
+!! physics may differ -> copy the original meshes (35 MB) from a machine that has them:
+!!   rsync -av <host>:<repo>/assets/g1_brachiation/menagerie/unitree_g1/assets/ \
+!!         assets/g1_brachiation/menagerie/unitree_g1/assets/
+MSG
+    exit 1
+fi
+echo "   mesh subtree OK ($assets_hash)"
+( cd assets/g1_brachiation && sha256sum -c menagerie_sha256.txt >/dev/null 2>&1 ) \
+    || echo "   note: the upstream XMLs differ (only matters when REBUILDING the scene;" \
+            "the tracked scene_bars*.xml is what runs)"
 
 echo "== 4/5 rebuild the scene assets from source (pure MuJoCo, no GPU) =="
 "$PY" assets/g1_brachiation/build_scene.py --export /tmp/scene_bars_check.xml --spacing 0.40

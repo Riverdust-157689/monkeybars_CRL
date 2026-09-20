@@ -1,0 +1,10 @@
+# Fingerprint of the MESH subtree only -- this is what the physics depends on.
+# The tracked scene_bars*.xml reference menagerie/unitree_g1/assets/** via meshdir;
+# the upstream XMLs are only used when REBUILDING the scene (build_scene.py).
+#
+# Verify (one line, from the repo root):
+#   ( cd assets/g1_brachiation/menagerie/unitree_g1 \
+#     && find assets -type f | LC_ALL=C sort | xargs sha256sum | sha256sum )
+#
+# Must print:
+ccd11011746f55d2b2d5dbd4eab63d9c46ce1a4d33b4d9dda5ad7b8e8b053574  -
