@@ -268,6 +268,7 @@ class Brachiation(Env):
         dwell_steps: int = 25,               # 0.5 s at 50 Hz
         start_bar_max: int = 0,              # M4: reset on bar U{0..start_bar_max}
         goal_ahead: bool = False,            # M4: sample the goal bar AFTER the start bar
+        goal_ahead_max: int = 0,             # M4: cap that distance (0 = no cap)
         naconmax: int = 16384,               # contact budget for ALL worlds (see note)
         njmax: int = 512,                    # constraint rows per world
         ls_iterations: Optional[int] = None, # None -> keep the scene XML value (20)
@@ -405,6 +406,7 @@ class Brachiation(Env):
         # absolute and correct whatever bar the episode starts on); what must not
         # happen is a goal bar *behind* the start, which is why `goal_ahead` exists.
         self.goal_ahead = bool(goal_ahead)
+        self.goal_ahead_max = int(goal_ahead_max)
         if self.goal_ahead and self.goal_bar is not None:
             raise ValueError("goal_ahead requires a sampled goal bar "
                              "(train.py: --train-goal-bar -1)")
@@ -771,6 +773,12 @@ class Brachiation(Env):
                 # "start anywhere in the first N-1 bars, the goal is any later bar")
                 k0i = k0.astype(jnp.int32)
                 span = jnp.maximum(self.n_bars - 1 - k0i, 1)
+                if self.goal_ahead_max > 0:
+                    # cap the distance: --goal-ahead-max 1 means "the goal is ALWAYS
+                    # exactly the next bar", i.e. a uniformly difficult, always
+                    # reachable instruction goal (run #14 showed that goals 2-4 bars
+                    # ahead destroy the transfer instead of extending it).
+                    span = jnp.minimum(span, self.goal_ahead_max)
                 gk = jnp.minimum(k0i + 1 + jax.random.randint(rng_goal_sel, (), 0, span),
                                  self.n_bars - 1)
             else:

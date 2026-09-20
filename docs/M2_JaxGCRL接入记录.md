@@ -2293,3 +2293,40 @@ $$g_k=\min\big(k_0+1+U\{0,\dots,n-2-k_0\},\;n-1\big)$$
 **⚠️ 实现 bug（用户这一问才查出来，已修）**：第一版里 `k0` 和 `gk` **共用同一个随机 key**（`randint(rng_goal,…)` 两次），同一个 key 的均匀比特同时决定两个抽样 ⇒ 两者强相关。实测 12 个环境里 `d = gk−k0` 有 11 个是 1 ⇒ **"目标可以是后面的任意一根"悄悄退化成"总是恰好下一根"**。修法：`rng_bar, rng_goal_sel = jax.random.split(rng_goal)`，`k0` 用前者、`gk` 用后者；旧路径（`goal_ahead=0` 且 `start_bar_max=0`）**仍用原来的 `rng_goal`**，所以 run #10/#13 等的随机流逐位不变 ✓。修后实测分布与理论完全吻合（上表）。
 
 若无这个修复，那条 6 h 命令实际跑的就近乎"run #13 + 随机起点"，几乎是白跑 —— 所以这一问很有价值。
+
+## 9.44 run #14（随机起点 + 朝前任意距离目标，6 h）**失败**：goal 一旦"够不到"，就退回旧吸引子
+
+**结果**（`runs/brach_dual_goal6h`，60 evals，50.13 M 步，git `656a931`）：
+
+| steps | len | fell | `advance_max` | `dualmax` | `single` | bar_L | bar_R | `max_bar` | dist/len | acc | critic |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 5.13 M | 501 | 0% | **0** | 2.7 | 467 | −29 | −496 | **0** | 2.91 | 0.585 | 1.72 |
+| 25.97 M | 501 | 0% | **0** | 3.4 | 479 | −19 | −498 | **0** | 2.67 | 0.386 | 2.40 |
+| 46.80 M | 47 | 100% | **0** | 1.9 | 9.6 | −36 | −45 | **0** | 3.27 | 0.443 | 2.20 |
+| 50.13 M | 16 | 100% | **0** | 3.0 | 6.6 | −7 | −13 | **0** | 2.80 | 0.439 | 2.26 |
+
+**失败特征**：`advance_max` 全程 0（连**第一次换手**都没做，`max_bar` 恒 0）；`dualmax` ≤ 4（双持能力**丢失**，run #13 是 70）；行为在两个旧吸引子之间来回——**单手稳定悬挂**（`single`≈477、`len`=501、`fell`=0，即 run #11 的侧吸引子）或**立刻掉落**（`len`=16、`fell`=100%）。而 critic 是**历次最健康**的（`acc` 0.36–0.585、`critic_loss` 1.7–2.7）⇒ **不是表征/优化崩，而是"目标作为优化对象"失效了**。
+
+**原因**：instruction goal 变成**不可达**。随机起点（k0∈{0..3}）+ 朝前**任意距离**（平均 1.75 根、48% ≥2 根、最远 4 根）⇒ 从起点看目标距离常驻 2.4–2.9（run #13 只有 0.6）⇒ **移动不划算**（任何动作都可能掉，而不动至少"距离不变"）⇒ rollout 退回两个局部吸引子 ⇒ 由这些轨迹重标记出的 goal 里**没有任何"走到远处的成功状态"** ⇒ 自我课程退化。这与 run #12 是**同一类**失败：目标必须是"可达的、带方向的势函数"。
+
+**方法学教训（重要）**：这一枪把**两件事混在了一起**——"起点随机化"和"目标变远"。run #13 证明"目标只差一根 + 起点 B0"能学；把距离放大到 1.75–4 根就毁掉了已有技能。所以下一步必须**拆开**：
+
+| 方案 | 内容 | 回答什么问题 |
+|---|---|---|
+| **A**（本轮已实现，推荐先跑）| 起点随机（`--start-bar-max 3`）+ 目标**恰好一根**（新增 `--goal-ahead 1 --goal-ahead-max 1`，实测 200 环境 `gk = k0+1` 恒成立 ✓）| 换手技能能否**跨杆泛化**、以及**连续过杆**是否会从重标记目标里自行长出来（看 `advance_max` 台阶）|
+| B | run #13 原配方跑 6 h（起点 B0、目标 B1）| 单手→双手过渡能否自己走完（我们原本要的那个数）|
+| C | `advance`（平移不变 + 到下一根杆的距离 + `hold_next` + `progress`）| **自推进目标**：instruction goal 永远是"当前站稳的下一根"（距离恒 0.6–1.2，始终可达），多杆由 `progress`/`k_ref` 推进。它的唯一已知阻塞（缺方向）已在 `bf34058` 修好，但**从未重跑** |
+
+**A 的命令（1.5 h 先探）**：
+
+```bash
+.venv-warp/bin/python src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant support_dual \
+  --train-goal-bar -1 --goal-ahead 1 --goal-ahead-max 1 --start-bar-max 3 --eval-goal-bar 1 \
+  --expl-hold 10 --num-evals 20 --steps 12200000 \
+  --checkpoint-dir runs/ckpt_dual_next --save-every 5 \
+  --impl warp --scene full035 --wandb --exp-name brach_dual_next
+```
+
+（`--eval-goal-bar 1`：eval 固定起点 B0、目标 B1 ⇒ 与 run #13 直接可比；多杆看 `advance_max`/`bar_*`。跑 6 h 就把 `--steps/--num-evals` 换成 `50300000/60`。）
