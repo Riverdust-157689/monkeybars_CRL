@@ -108,7 +108,8 @@ class FeatureLayout(NamedTuple):
     goal_indices: Tuple[int, ...]
 
 
-GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "park",
+GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
+                 "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
 # ---- M4.0 "advance one bar" ------------------------------------------------
@@ -145,13 +146,21 @@ K_SUSTAIN = 25
 
 # "support" and "support_hold" share the max(c_L, c_R) state slot; "support_hold"
 # adds one more goal dimension, the *sustained-contact* feature (see HOLD_TAU).
-SUPPORT_FAMILY = ("support", "support_hold", "support_dual")
+SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax")
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
 # adds a second one, h_dual, for "both hands inside the SAME bar's window" (see
 # docs/M4_对与#11的分析和goal的设计问题的讨论.md 5).  The two together give the goal
 # space an explicit three-layer structure -- flight (0,0) -> single support (1,0)
 # -> dual support (1,1) -- without constraining how the policy moves between them.
-HOLD_FAMILY = ("support_hold", "support_dual")
+HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax")
+# "dual_nomax" = run #13's support_dual minus the instantaneous `max(c_L,c_R)`
+# entry: goal = [x, z, p_L(3), p_R(3), h_any, h_dual] (10-D).  That entry was the
+# only *saturating* goal dim and, as a settled hang reads ~0.55 against a goal of
+# 1.0, it contributed a ~0.2 constant term to every distance (the "unreachable
+# c_sup" readout problem).  h_any/h_dual are sustained-contact features: they have
+# a direction (they grow while gripping, reset on release) and need no hand-tuned
+# box, so the goal stays a pure function of hand contact + end-effector pose.
+DUAL_FAMILY = ("support_dual", "dual_nomax")
 # `hold = 1 - exp(-streak / HOLD_TAU)` where `streak` is the number of consecutive
 # steps with at least one hand inside the grasp window of some bar (< GRASP_THRESH,
 # the same criterion as bar_L/bar_R/max_bar -- NOT max(c) > 0.5, which would call a
@@ -227,7 +236,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     # instantaneous state), which is why `_state_features`/`_achieved_goal` take
     # it as an extra argument.
     hold = nxt(1) if goal_variant in HOLD_FAMILY else slice(i, i)
-    hold_dual = nxt(1) if goal_variant == "support_dual" else slice(i, i)
+    hold_dual = nxt(1) if goal_variant in DUAL_FAMILY else slice(i, i)
     # "park": how long the TORSO has been inside some bar's hang box (history)
     park = nxt(1) if goal_variant == "park" else slice(i, i)
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
@@ -242,10 +251,13 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     if goal_variant == "full":
         goal_indices = goal_indices + (grasp_ind.start, grasp_ind.start + 1)
     elif goal_variant in SUPPORT_FAMILY:
-        goal_indices = goal_indices + (grasp_support.start,)
+        # "dual_nomax" deliberately does NOT put max(c_L,c_R) in the goal (it stays
+        # in the state as observable context); every other support variant does.
+        if goal_variant != "dual_nomax":
+            goal_indices = goal_indices + (grasp_support.start,)
         if goal_variant in HOLD_FAMILY:
             goal_indices = goal_indices + (hold.start,)
-        if goal_variant == "support_dual":
+        if goal_variant in DUAL_FAMILY:
             goal_indices = goal_indices + (hold_dual.start,)
     elif goal_variant in CROSS_FAMILY:
         # indices INTO the state block: [0..2]=rel_pR, 3=d_RB1, 4=c_RB1, 5=c_LB0,
@@ -334,6 +346,10 @@ class Brachiation(Env):
              "support_hold": _pos + [10, 19],
              # support + h_any + h_dual (both appended after the superset's hold)
              "support_dual": _pos + [10, 19, 20],
+             # ... and support_dual WITHOUT the instantaneous max(c_L,c_R) ("c_sup",
+             # superset index 10): what run #14 should have been -- run #13's recipe
+             # minus the one saturating, direction-free goal entry.
+             "dual_nomax": _pos + [19, 20],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
              "park": [0, 1, 27],
              "position": list(_pos),
@@ -626,7 +642,7 @@ class Brachiation(Env):
                 # from this goal", so hiding it would make the task a POMDP and alias
                 # the critic (M4 discussion doc, section on state aliasing).
                 parts.append(jnp.asarray(hold)[None])
-            if self.goal_variant == "support_dual":
+            if self.goal_variant in DUAL_FAMILY:
                 parts.append(jnp.asarray(hold_dual)[None])
         if self.goal_variant == "park":
             # only the parked streak is added: x_torso and z_torso are already

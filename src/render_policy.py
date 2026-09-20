@@ -137,7 +137,7 @@ def main() -> int:
     variant_cfg = str(cfg.get("goal_variant", ""))
     uses_park = variant_cfg == "park"
     uses_hold = "hold" in variant_cfg and not uses_park
-    uses_dual = variant_cfg == "support_dual"
+    uses_dual = variant_cfg in ("support_dual", "dual_nomax")
     if uses_dual:
         achieved = jax.jit(jax.vmap(lambda ps, h, hd: env._achieved_goal(
             ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd))))
