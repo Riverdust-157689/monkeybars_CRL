@@ -47,12 +47,53 @@ else
 fi
 
 echo "== 3/5 Unitree G1 meshes (38 MB, not tracked) =="
-if [ ! -f assets/g1_brachiation/menagerie/unitree_g1/g1_with_hands.xml ]; then
-    tmp="$(mktemp -d)"
-    git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie "$tmp/menagerie"
-    mkdir -p assets/g1_brachiation/menagerie
-    cp -r "$tmp/menagerie/unitree_g1" assets/g1_brachiation/menagerie/
-    rm -rf "$tmp"
+MEN_DIR=assets/g1_brachiation/menagerie
+if [ ! -f "$MEN_DIR/unitree_g1/g1_with_hands.xml" ]; then
+    mkdir -p "$MEN_DIR"
+    src_dir=""
+    tmp=""
+    if [ -n "${MENAGERIE_DIR:-}" ] && [ -d "${MENAGERIE_DIR}/unitree_g1" ]; then
+        echo "   using MENAGERIE_DIR=$MENAGERIE_DIR"
+        src_dir="$MENAGERIE_DIR"
+    else
+        # Only the unitree_g1 subtree is needed, so use a blobless + sparse clone:
+        # the official repo is large and a plain `--depth 1` clone downloads the
+        # whole tree (that is what tends to die with "curl 56 / TLS connection
+        # non-properly terminated" on flaky links).  HTTP/1.1 avoids the HTTP/2
+        # mid-pack disconnects, and we retry.
+        for attempt in 1 2 3; do
+            tmp="$(mktemp -d)"
+            log="$tmp/clone.log"
+            if git -c http.version=HTTP/1.1 -c http.postBuffer=524288000 \
+                   clone --depth 1 --filter=blob:none --sparse \
+                   https://github.com/google-deepmind/mujoco_menagerie "$tmp/m" >"$log" 2>&1 \
+               && git -C "$tmp/m" sparse-checkout set unitree_g1 >>"$log" 2>&1; then
+                src_dir="$tmp/m"; break
+            fi
+            echo "   clone attempt $attempt/3 failed:"; tail -3 "$log" | sed 's/^/     /'
+            rm -rf "$tmp"; tmp=""
+        done
+    fi
+    if [ -n "$src_dir" ]; then
+        cp -r "$src_dir/unitree_g1" "$MEN_DIR/"
+        echo "   got $MEN_DIR/unitree_g1"
+        case "$src_dir" in /tmp/*|/var/tmp/*) rm -rf "$tmp";; esac
+    else
+        cat <<'MSG'
+!! could not fetch the Unitree G1 meshes (network).  Three ways forward:
+   1) retry later / on a better link (the clone is retried 3x with HTTP/1.1);
+   2) copy them from a machine that already has them (only ~38 MB):
+
+        rsync -av <other-host>:<repo>/assets/g1_brachiation/menagerie/unitree_g1 \
+              assets/g1_brachiation/menagerie/
+        (cd assets/g1_brachiation && sha256sum -c menagerie_sha256.txt)
+
+   3) point at an existing menagerie checkout and re-run this script:
+
+        MENAGERIE_DIR=/path/to/mujoco_menagerie tools/setup_env.sh
+MSG
+        exit 1
+    fi
 fi
 ( cd assets/g1_brachiation && sha256sum -c menagerie_sha256.txt ) || {
     echo "!! menagerie hashes differ from the ones this repo was built with"
