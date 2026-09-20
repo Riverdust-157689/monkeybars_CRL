@@ -46,7 +46,7 @@ else
     git -C third_party/jaxgcrl apply ../../patches/jaxgcrl_crl_losses.patch
 fi
 
-echo "== 3/5 Unitree G1 meshes (38 MB, not tracked) =="
+echo "== 3/5 Unitree G1 meshes (committed with the repo; only fetched if missing) =="
 MEN_DIR=assets/g1_brachiation/menagerie
 if [ ! -f "$MEN_DIR/unitree_g1/g1_with_hands.xml" ]; then
     mkdir -p "$MEN_DIR"

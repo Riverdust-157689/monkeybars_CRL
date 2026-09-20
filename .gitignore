@@ -21,9 +21,10 @@ third_party/jaxgcrl/jaxgcrl/**/__pycache__/
 third_party/jaxgcrl/jaxgcrl.egg-info/
 .third_party/
 
-# Upstream Unitree G1 meshes (38 MB); the generated scene XML/JSON we DO version
-# live next to them and only reference this directory.
-assets/g1_brachiation/menagerie/
+# Upstream Unitree G1 meshes: COMMITTED (see docs/复现环境.md).  They are small
+# enough (~35 MB) and fetching them from a flaky link was the single most common
+# setup failure; the scene XML/JSON next to them only reference this directory.
+# Verify with assets/g1_brachiation/menagerie_assets_hash.txt.
 
 # Reference PDFs (static, 37 MB)
 ref papers/
