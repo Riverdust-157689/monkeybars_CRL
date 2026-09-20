@@ -2477,3 +2477,19 @@ $$g=\big[\;\underbrace{x_{\rm torso}}_{\text{绝对}},\;\underbrace{z_{\rm torso
 4. 需要时再加回 `h_dual`（1 维）。
 
 **实现要点**（`src/envs/brachiation.py`）：新增 goal 变体 `park`（3 维，走 `support` 家族的"每 bar 一套 goal"路径）＋ `info["park_streak"]`（episode 级清零、已进 `episode_info_zero`）＋ 判定盒子参数（`PARK_RX=0.10, PARK_RZ=0.15`）＋ `metrics` 里加 `cov_park_runmax_improve` / `cov_park_on_steps`（评估器白名单与 `check_metrics.py` 同步），并把它加进 `GOAL_VARIANTS` 与 `train.py --goal-variant`。
+
+### 9.48.5 `park` 变体已实现（run #17 待跑）
+
+`--goal-variant park`（3 维，`state=142 / goal=3 / obs=145`，`goal_indices=(0,2,127)`）：
+`g = [x_torso, z_torso, h_park]`，`h_park = 1-e^{-S_park/10}`，`S_park` = 连续"躯干位于**某根杆**悬挂点 ±(0.10, 0.15) m 盒内"的步数（`info["park_streak"]`，episode 级清零）；
+每根杆一套绝对 goal（与 `support` 家族同一路径，`goal_set[k] = (x_{B_k}, z_hang, 1)`）。
+
+CPU 校验：
+| 状态 | `park_streak` | `h_park` | 到 B1 目标距离 |
+|---|---|---|---|
+| t=0 吊在 B0（streak 从 0 起）| 0 | 0.00 | **1.060** = √(0.35²+1²) |
+| 继续吊 25 步 | 25 | 0.92 | **0.343**（≈ 一格杆距 0.35）|
+| 目标正是所在杆时 | 25 | 0.92 | ≈0.08 ⇒ `success`（阈值 0.18）|
+
+新指标：`cov_park_runmax_improve`（求和 = 最长停放段）、`cov_park_on_steps`、`cov_park_hold_sum`（Σ`h_park`）；评估器白名单与 `check_metrics.py` 已同步。
+`train.py` 新增 `--goal-reach-thresh`（默认 0.35 是为 10 维姿态目标定的；**粗目标的自然尺度是一格杆距 0.35，所以 `park` 用 0.18**）。

@@ -135,7 +135,8 @@ def main() -> int:
     # Goal variants that use the sustained-contact entry ("support_hold") need the
     # streak from info; `_hold_feature` keeps the single source of truth for the map.
     variant_cfg = str(cfg.get("goal_variant", ""))
-    uses_hold = "hold" in variant_cfg
+    uses_park = variant_cfg == "park"
+    uses_hold = "hold" in variant_cfg and not uses_park
     uses_dual = variant_cfg == "support_dual"
     if uses_dual:
         achieved = jax.jit(jax.vmap(lambda ps, h, hd: env._achieved_goal(
@@ -166,7 +167,11 @@ def main() -> int:
         dmin = d.min(axis=-1)
         bar = np.where(dmin < 0.05, w.argmax(axis=-1), -1)
         # measure the goal distance ourselves: reset() seeds metrics with zeros
-        if uses_dual:
+        if uses_park:
+            diff = (np.asarray(achieved(s.pipeline_state, 0.0, 0.0, 0.0, 0.0,
+                                        env._hold_feature(s.info["park_streak"])))
+                    - np.asarray(s.info["goal"]))
+        elif uses_dual:
             diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
                                         s.info["dual_streak"]))
                     - np.asarray(s.info["goal"]))

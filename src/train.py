@@ -141,7 +141,7 @@ def parse() -> argparse.Namespace:
                          "docs/执行计划.md")
     ap.add_argument("--goal-variant", default="full",
                     choices=["full", "support", "support_hold", "support_dual",
-                             "position", "cross", "cross3", "hold2", "advance"],
+                             "park", "position", "cross", "cross3", "hold2", "advance"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
                          "support = [...,max(c_L,c_R)] (9-D, releasing ONE hand is free but "
                          "losing the last grip is penalised); support_hold = support + the "
@@ -151,6 +151,11 @@ def parse() -> argparse.Namespace:
                          "position = [x,z,p_L(3),p_R(3)] (8-D, grasp ignored -> the policy "
                          "can learn to hang without grasping).  See "
                          "docs/M2_JaxGCRL接入记录.md 9.22/9.25/9.34.  Must match at eval time.")
+    ap.add_argument("--goal-reach-thresh", type=float, default=0.35,
+                    help="success radius in goal space (env kwarg goal_reach_thresh). "
+                         "The 0.35 default was tuned for the 10-dim posture goal; the "
+                         "coarse 'park' goal's natural scale is one bar spacing (0.35), "
+                         "so use ~0.18 there.")
     ap.add_argument("--start-bar-max", type=int, default=0,
                     help="M4: reset on a uniformly random bar in [0, k] by translating "
                          "the robot by k*spacing (bars are periodic, so the physics is "
@@ -299,6 +304,7 @@ def main() -> int:
         print(f"[warn] --goal-position-only overrides --goal-variant {args.goal_variant}")
     env_kwargs = dict(impl=args.impl, scene=args.scene, n_frames=args.n_frames,
                       goal_bar_min=args.train_goal_bar_min,
+                      goal_reach_thresh=args.goal_reach_thresh,
                       goal_variant=goal_variant,
                       action_window=args.action_window,
                       start_bar_max=args.start_bar_max,

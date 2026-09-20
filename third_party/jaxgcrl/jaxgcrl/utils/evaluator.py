@@ -160,6 +160,9 @@ class ActorEvaluator:
                         "cov_dual_on_steps",
                         "cov_dual_runmax_improve",
                         "cov_dual_hold_sum",
+                        "cov_park_on_steps",
+                        "cov_park_runmax_improve",
+                        "cov_park_hold_sum",
                         "cov_single_on_steps",
                         # M4: how many bars the episode advanced (sustained grips)
                         "advance_max",
