@@ -26,17 +26,16 @@ else
     "$PY" -m pip install -r requirements.lock.txt
 fi
 
-echo "== 2/5 upstream JaxGCRL @ $JAXGCRL_COMMIT + our patch =="
-if [ ! -d third_party/jaxgcrl/.git ]; then
+echo "== 2/5 JaxGCRL @ $JAXGCRL_COMMIT + our patch =="
+if [ -f third_party/jaxgcrl/jaxgcrl/agents/crl/crl.py ]; then
+    echo "   using the VENDORED sources (tracked in this repo; no clone, no patch step)"
+    echo "   provenance + re-sync: third_party/jaxgcrl/PROVENANCE.md"
+else
+    echo "   vendored tree missing -> clone upstream and apply the patch"
     mkdir -p third_party
     git clone https://github.com/MichalBortkiewicz/JaxGCRL third_party/jaxgcrl
     git -C third_party/jaxgcrl checkout "$JAXGCRL_COMMIT"
-fi
-if git -C third_party/jaxgcrl apply --check ../../patches/jaxgcrl_crl_losses.patch 2>/dev/null; then
     git -C third_party/jaxgcrl apply ../../patches/jaxgcrl_crl_losses.patch
-    echo "   patch applied"
-else
-    echo "   patch already applied (or does not apply cleanly -- run tools/make_patch.sh --check)"
 fi
 
 echo "== 3/5 Unitree G1 meshes (38 MB, not tracked) =="

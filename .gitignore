@@ -5,9 +5,20 @@ __pycache__/
 *.pyc
 
 # Third-party checkouts (re-fetch with the command in docs/M0_M1_报告.md).
-# Our modifications to jaxgcrl are versioned as patches/jaxgcrl_crl_losses.patch
-# -- regenerate + verify with tools/make_patch.sh after every change there.
-third_party/
+# EXCEPTION: jaxgcrl is *vendored* -- its Python sources (~400 KB) are tracked so a
+# fresh clone needs no network and no patch step.  Everything else of it (the .git
+# clone, the 36 MB of upstream benchmark meshes, docs, notebooks, tests) stays out;
+# see third_party/jaxgcrl/PROVENANCE.md.
+third_party/*
+!third_party/jaxgcrl/
+third_party/jaxgcrl/*
+!third_party/jaxgcrl/LICENSE
+!third_party/jaxgcrl/PROVENANCE.md
+!third_party/jaxgcrl/jaxgcrl/
+!third_party/jaxgcrl/jaxgcrl/**
+third_party/jaxgcrl/jaxgcrl/envs/assets/
+third_party/jaxgcrl/jaxgcrl/**/__pycache__/
+third_party/jaxgcrl/jaxgcrl.egg-info/
 .third_party/
 
 # Upstream Unitree G1 meshes (38 MB); the generated scene XML/JSON we DO version

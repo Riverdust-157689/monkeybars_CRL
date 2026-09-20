@@ -16,7 +16,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JAXGCRL="$REPO/third_party/jaxgcrl"
 PATCH="$REPO/patches/jaxgcrl_crl_losses.patch"
 
-[ -d "$JAXGCRL/.git" ] || { echo "error: $JAXGCRL is not a git checkout"; exit 1; }
+if [ ! -d "$JAXGCRL/.git" ]; then
+    echo "third_party/jaxgcrl is the VENDORED tree (no .git): nothing to regenerate."
+    echo "Re-sync procedure (third_party/jaxgcrl/PROVENANCE.md):"
+    echo "  tmp=\$(mktemp -d); git clone https://github.com/MichalBortkiewicz/JaxGCRL \$tmp/j"
+    echo "  git -C \$tmp/j checkout 5a6e7a0 && git -C \$tmp/j apply \$PWD/patches/jaxgcrl_crl_losses.patch"
+    echo "  diff -r --exclude=assets --exclude=__pycache__ \$tmp/j/jaxgcrl third_party/jaxgcrl/jaxgcrl"
+    exit 0
+fi
 
 if [ "${1:-}" != "--check" ]; then
     git -C "$JAXGCRL" diff > "$PATCH"
