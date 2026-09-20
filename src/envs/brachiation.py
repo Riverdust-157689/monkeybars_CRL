@@ -131,8 +131,15 @@ GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "park",
 # ---- M5 "park" goal (coarse, torso-only) ----------------------------------
 # The whole terminal condition is "the torso is parked under the target bar and
 # has been for a while".  Rationale + evidence: docs/M2_JaxGCRL接入记录.md 9.48.
-PARK_RX = 0.10          # m, |x_torso - x_bar| for "parked under this bar"
-PARK_RZ = 0.15          # m, |z_torso - z_hang|
+# "parked under a bar" box for the coarse `park` goal.  Sizing follows the same
+# logic as the 5 cm grasp threshold (see docs/M4 ... #8): too tight and a genuine
+# stable hang flickers the streak, too loose and a swing-through counts as rest.
+# Measured natural hang (CPU, d035, 25 settled steps): |dx| ~= 0.015-0.02,
+# dz ~= -0.034 w.r.t. the keyframe torso height, so these are ~3x margins.
+# x-coverage is 2*0.06/0.35 = 34% of the inter-bar gap, i.e. the box does not
+# swallow the whole swing corridor.
+PARK_RX = 0.06          # m, |x_torso - x_bar| for "parked under this bar"
+PARK_RZ = 0.10          # m, |z_torso - z_hang|
 K_SUSTAIN = 25
 
 
@@ -367,6 +374,17 @@ class Brachiation(Env):
         bpos = np.array([m.body_pos[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"bar{i}")]
                          for i in range(self.n_bars)])
         self.bar_x = jnp.array(bpos[:, 0], dtype=jnp.float32)
+        # Torso x at the settled hang under each bar.  The body does NOT hang
+        # directly under the bar it holds: the hands hook over the bar, so the
+        # keyframe torso x is offset from its bar by `dx_goal` (same quantity
+        # `_features_numpy`/`_advance_features` already use).  Measured on d035:
+        # bar_x[0] = 0.056 while the hanging torso sits at -0.015, i.e. dx_goal
+        # ~= -0.071 m.  Anything that asks "is the torso hanging under bar k"
+        # must compare against THIS, not against bar_x -- centring the box on
+        # bar_x puts the natural hang right on the boundary, which makes the
+        # sustained-contact streaks flicker (exactly the failure mode the M4 doc
+        # section 8 warns about for the 5 cm grasp threshold).
+        self.hang_x = self.bar_x + (float(kd.qpos[0]) - float(self.bar_x[0]))
         self.bar_z = float(bpos[0, 2])
         self.bar_spacing = float(bpos[1, 0] - bpos[0, 0]) if self.n_bars > 1 else 0.0
 
@@ -504,7 +522,7 @@ class Brachiation(Env):
         dual_now = jnp.any((d[0] < GRASP_THRESH) & (d[1] < GRASP_THRESH)).astype(jnp.float32)
         run, both_imp, both_max = streak(both, "cov_both_run")
         run_dual, dual_imp, dual_max = streak(dual_now, "cov_dual_run")
-        park_now = (jnp.any(jnp.abs(self.bar_x - data.qpos[0]) < PARK_RX)
+        park_now = (jnp.any(jnp.abs(self.hang_x - data.qpos[0]) < PARK_RX)
                     & (jnp.abs(data.qpos[2] - self.key_qpos[2]) < PARK_RZ))
         _run_park, park_imp, _max_park = streak(park_now.astype(jnp.float32), "cov_park_run")
         run_b1, b1_imp, b1_max = streak(hold_b1, "cov_b1_run")
@@ -900,7 +918,7 @@ class Brachiation(Env):
         # ~10 steps (0.2 s) already distinguishes "parked (i.e. supported)" from
         # "flew past" -- and unlike a hand-contact proxy it needs no hand
         # calibration (see 9.48).
-        parked = (jnp.any(jnp.abs(self.bar_x - data.qpos[0]) < PARK_RX)
+        parked = (jnp.any(jnp.abs(self.hang_x - data.qpos[0]) < PARK_RX)
                   & (jnp.abs(data.qpos[2] - self.key_qpos[2]) < PARK_RZ))
         park_streak = jnp.where(parked, state.info["park_streak"] + 1.0, 0.0)
         h_park = self._hold_feature(park_streak)

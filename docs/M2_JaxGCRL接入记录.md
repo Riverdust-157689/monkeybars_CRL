@@ -2478,18 +2478,45 @@ $$g=\big[\;\underbrace{x_{\rm torso}}_{\text{绝对}},\;\underbrace{z_{\rm torso
 
 **实现要点**（`src/envs/brachiation.py`）：新增 goal 变体 `park`（3 维，走 `support` 家族的"每 bar 一套 goal"路径）＋ `info["park_streak"]`（episode 级清零、已进 `episode_info_zero`）＋ 判定盒子参数（`PARK_RX=0.10, PARK_RZ=0.15`）＋ `metrics` 里加 `cov_park_runmax_improve` / `cov_park_on_steps`（评估器白名单与 `check_metrics.py` 同步），并把它加进 `GOAL_VARIANTS` 与 `train.py --goal-variant`。
 
-### 9.48.5 `park` 变体已实现（run #17 待跑）
+### 9.48.5 `park` 变体已实现（run #17/#18 待跑）
 
-`--goal-variant park`（3 维，`state=142 / goal=3 / obs=145`，`goal_indices=(0,2,127)`）：
-`g = [x_torso, z_torso, h_park]`，`h_park = 1-e^{-S_park/10}`，`S_park` = 连续"躯干位于**某根杆**悬挂点 ±(0.10, 0.15) m 盒内"的步数（`info["park_streak"]`，episode 级清零）；
-每根杆一套绝对 goal（与 `support` 家族同一路径，`goal_set[k] = (x_{B_k}, z_hang, 1)`）。
+`--goal-variant park`（3 维，`state=142 / goal=3 / obs=145`，`goal_indices=(0, 2, 127)`）：
 
-CPU 校验：
-| 状态 | `park_streak` | `h_park` | 到 B1 目标距离 |
-|---|---|---|---|
-| t=0 吊在 B0（streak 从 0 起）| 0 | 0.00 | **1.060** = √(0.35²+1²) |
-| 继续吊 25 步 | 25 | 0.92 | **0.343**（≈ 一格杆距 0.35）|
-| 目标正是所在杆时 | 25 | 0.92 | ≈0.08 ⇒ `success`（阈值 0.18）|
+```
+g = [x_torso, z_torso, h_park],   h_park = 1 - exp(-S_park / 10)
+```
 
-新指标：`cov_park_runmax_improve`（求和 = 最长停放段）、`cov_park_on_steps`、`cov_park_hold_sum`（Σ`h_park`）；评估器白名单与 `check_metrics.py` 已同步。
-`train.py` 新增 `--goal-reach-thresh`（默认 0.35 是为 10 维姿态目标定的；**粗目标的自然尺度是一格杆距 0.35，所以 `park` 用 0.18**）。
+`S_park` = 连续"躯干位于**某根杆的悬挂盒**内"的步数（episode 级清零）。每根杆一套绝对
+goal（与 `support` 家族同一路径，`goal_set[k] = (hang_x[k], z_hang, 1)`）。
+
+**CPU 实测发现的关键修正 —— 盒子必须锚在躯干悬挂位，不是杆的 x。**
+G1 双手勾杆时身体并不在杆的正下方：d035 下 keyframe 躯干 `x = -0.0153`，而
+`bar_x[0] = +0.056`，偏移 `dx_goal = -0.071 m`（环境里本就有这个量，`advance` 特征一直
+在用）。最初把盒子锚在 `bar_x` 上时，自然悬挂的 `dx` 恰好是 **0.060–0.068**，卡在 ±0.06
+边界上，streak 要到 t=21 才开始（前 20 步反复清零）——这正是 M4 文档 §8 提醒的"判据太紧
+会让真实稳定悬挂 flicker"。改成 `self.hang_x = bar_x + dx_goal` 后 streak 从 **t=1**
+起单调增长，120 步无清零（`dx_hang <= 0.038`、`dz <= 0.042`，对 0.06/0.10 仍有
+1.6–2.5× 余量；x 覆盖 `2*0.06/0.35 = 34%` 的杆间走廊，不会把整条摆动通道吞掉）。
+
+| 状态（d035）| `S_park` | `h_park` | `dist` | `success`（<0.18）|
+|---|---|---|---|---|
+| t=1 吊在 B0，goal=B0 | 1 | 0.10 | 0.905 | 0 |
+| t=15 | 15 | 0.78 | 0.225 | 0 |
+| t=30 | 30 | 0.95 | 0.064 | **1** |
+| t=120（稳态）| 120 | 1.00 | **0.045** | **1** |
+| 吊在 B0、goal=B1（60 步）| 60 | 1.00 | **0.315** | **0** |
+
+⇒ `--goal-reach-thresh 0.18` 正好落在 0.045 与 0.315 之间：对"停在对的杆下"留 4× 余量，
+对"停在隔壁杆下"留 1.75× 距离。**默认 0.35 绝对不能用**——它恰好等于一格杆距，会把
+"停在隔壁杆"也判成成功。
+
+新指标 `cov_park_runmax_improve`（求和 = 最长连续停放段）、`cov_park_on_steps`、
+`cov_park_hold_sum`（Σ `h_park`）；评估器白名单（`patches/jaxgcrl_crl_losses.patch`）与
+`src/check_metrics.py` 已同步。`train.py` 新增 `--goal-reach-thresh`（默认 0.35 是为 10 维
+姿态目标定的，粗目标不要用它）。
+
+一个已知的、无害的读法问题：`h_park` 只在躯干**离开盒子**后才回落，而 episode 在
+`z < z_hang - 0.8` 才结束；自由落体走完 0.10 m 盒子下沿约需 7–8 步，所以"松手后头几步"
+仍记在 streak 里。因为 `h_park` 是指数累积的持续性量、且成功率由 `dist` 的 `(1-h)` 项
+与 `(x,z)` 项共同决定，短暂下落不会伪装成"停稳"（吊着不动 120 步得 `h=1.00`，而任何
+真实下落都会在 ~8 步内把 `h` 拉回 0.5 以下并继续掉）。
