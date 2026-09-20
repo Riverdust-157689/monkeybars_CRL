@@ -47,7 +47,9 @@ tools/setup_env.sh                    # venv + 依赖 + jaxgcrl + 网格 + 资�
 | `.venv*` | 1–2 GB | `tools/setup_env.sh` |
 | `third_party/jaxgcrl` 的**其余部分** | 上游的 `.git`、36 MB benchmark 网格、docs/notebooks/tests | 不需要 |
 | `runs/` | 训练产物（checkpoint/progress.csv/渲染） | 自行 `rsync`；每个 `runs/<exp>/args.json` 里记了 `git_commit` 与全部超参 |
-| `assets/g1_brachiation/menagerie/` | 上游网格（38 MB） | `tools/setup_env.sh` + `menagerie_sha256.txt` 校验 |
+
+> **G1 模型（网格 + 上游 XML，38 MB）已随仓库提交**，所以 `git clone` 之后不需要再联网取任何模型文件；
+> 指纹见 `assets/g1_brachiation/menagerie_assets_hash.txt`（网格，物理相关）与 `menagerie_sha256.txt`（上游 XML，仅重建场景用）。
 | `ref papers/` | 参考文献 PDF | 不需要 |
 
 ## 为什么 jaxgcrl 是 vendored，而不是 fork / submodule
