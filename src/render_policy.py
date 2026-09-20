@@ -38,7 +38,11 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(HERE)
-for p in (HERE, os.path.join(HERE, "envs")):
+for p in (HERE, os.path.join(HERE, "envs"),
+        # the vendored upstream JaxGCRL (third_party/jaxgcrl) -- it is NOT a pip
+        # dependency any more, so it must be on sys.path for `import jaxgcrl`
+        os.path.join(REPO, "third_party", "jaxgcrl"),
+          ):
     if p not in sys.path:
         sys.path.insert(0, p)
 

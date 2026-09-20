@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "envs"))
+sys.path.insert(0, os.path.join(REPO, "third_party", "jaxgcrl"))  # vendored upstream
 
 from envs.brachiation import create_brachiation  # noqa: E402
 

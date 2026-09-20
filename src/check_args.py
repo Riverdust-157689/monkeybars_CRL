@@ -133,6 +133,8 @@ def crl_kwargs_ok(path: str) -> int:
         print(f"SKIP {path}: no CRL(...) call found")
         return 0
     try:
+        repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        sys.path.insert(0, os.path.join(repo, "third_party", "jaxgcrl"))
         from jaxgcrl.agents.crl.crl import CRL  # heavy import (jax/brax)
     except Exception as exc:                                    # pragma: no cover
         print(f"SKIP CRL kwargs check ({type(exc).__name__}: {exc})")
