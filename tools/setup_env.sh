@@ -123,6 +123,22 @@ else
     echo "         scene_bars*.xml is what actually runs, so training is unaffected."
 fi
 
+# GPU runtime: install the pip CUDA/cuDNN wheels only when the machine has an
+# NVIDIA GPU but no system cuDNN (otherwise JAX silently falls back to CPU).
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if ! "$PY" -c "import jax, sys; sys.exit(0 if any(d.platform=='gpu' for d in jax.devices()) else 1)" >/dev/null 2>&1; then
+        echo "   NVIDIA GPU present but jax sees no GPU device -> installing requirements-gpu.txt"
+        if command -v uv >/dev/null 2>&1; then
+            uv pip install --python "$PY" -r requirements-gpu.txt || true
+        else
+            "$PY" -m pip install -r requirements-gpu.txt || true
+        fi
+        "$PY" -c "import jax; print('   jax.devices() =', jax.devices())" || true
+    else
+        echo "   jax already sees a GPU device"
+    fi
+fi
+
 echo "== 4/5 rebuild the scene assets from source (pure MuJoCo, no GPU) =="
 "$PY" assets/g1_brachiation/build_scene.py --export /tmp/scene_bars_check.xml --spacing 0.40
 "$PY" - <<'PY'

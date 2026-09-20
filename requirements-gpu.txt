@@ -1,0 +1,12 @@
+# GPU runtime for JAX (needed on any machine whose system does NOT already provide
+# CUDA 12 + cuDNN 9 -- the original dev box had them system-wide, which is why the
+# main lock has no nvidia-* entries and a fresh machine falls back to CPU with
+# "RuntimeError: Unable to load cuDNN").
+#
+#   uv pip install --python .venv-warp/bin/python -r requirements-gpu.txt
+#   .venv-warp/bin/python -c "import jax; print(jax.devices())"   # must list CudaDevice
+#
+# These are exactly the "with-cuda" extras of jax-cuda12-plugin==0.6.2 (the version
+# the runs used), so the CUDA/cuDNN libraries match jaxlib 0.6.2.  Taking them from
+# the plugin's own metadata keeps jax itself pinned by requirements.lock.txt.
+jax-cuda12-plugin[with-cuda]==0.6.2
