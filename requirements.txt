@@ -9,6 +9,9 @@
 jax==0.6.2
 jaxlib==0.6.2
 mujoco==3.13.0
+mujoco-mjx==3.13.0      # separate distribution: provides mujoco.mjx (the warp
+                        # backend comes from its [warp] extra; warp-lang is pinned
+                        # below explicitly)
 warp-lang==1.17.0
 flax==0.10.7
 optax==0.2.8

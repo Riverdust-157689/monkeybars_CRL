@@ -19,11 +19,19 @@ if [ ! -x "$PY" ]; then
         python3.10 -m venv .venv-warp
     fi
 fi
-if command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$PY" -r requirements.lock.txt
-else
-    "$PY" -m pip install -U pip
-    "$PY" -m pip install -r requirements.lock.txt
+install_reqs () {   # $1 = requirements file
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "$PY" -r "$1"
+    else
+        "$PY" -m pip install -r "$1"
+    fi
+}
+if command -v uv >/dev/null 2>&1; then :; else "$PY" -m pip install -U pip; fi
+if ! install_reqs requirements.lock.txt; then
+    echo "!! the pinned lock did not resolve on this machine -- falling back to the"
+    echo "!! curated direct-dependency list (requirements.txt).  Please report which"
+    echo "!! package failed so the lock can be fixed."
+    install_reqs requirements.txt
 fi
 
 echo "== 2/5 JaxGCRL @ $JAXGCRL_COMMIT + our patch =="

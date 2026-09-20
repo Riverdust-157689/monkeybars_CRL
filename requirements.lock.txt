@@ -1,6 +1,11 @@
 # Full pinned set of the .venv-warp this repo's runs were produced with
 # (Python 3.10.12, ~90 packages).  Recorded from the installed metadata.
 #   uv pip install --python .venv-warp/bin/python -r requirements.lock.txt
+#
+# NOTE: `jaxgcrl` is deliberately NOT listed.  It is vendored in
+# third_party/jaxgcrl/ and imported via sys.path; installing the PyPI jaxgcrl
+# would drag in its own (old) pin mujoco-mjx==3.2.7 and conflict with the
+# mujoco/mujoco-mjx 3.13.0 this project actually uses.
 absl-py==2.5.0
 aiofiles==25.1.0
 annotated-types==0.8.0
@@ -34,7 +39,6 @@ itsdangerous==2.2.0
 jax-cuda12-pjrt==0.6.2
 jax-cuda12-plugin==0.6.2
 jax==0.6.2
-jaxgcrl==0.2.8
 jaxlib==0.6.2
 jaxopt==0.8.5
 Jinja2==3.1.6
