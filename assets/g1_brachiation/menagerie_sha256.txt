@@ -1,3 +1,9 @@
+# PURPOSE: these are the *upstream XMLs*, needed ONLY when rebuilding the scene
+#          from source (build_scene.py).  They are NOT needed to run: the tracked
+#          scene_bars*.xml references the mesh files via meshdir, and only THOSE
+#          affect the physics (see menagerie_assets_hash.txt for that fingerprint).
+#          Upstream may also have renamed/removed some of these files; a missing or
+#          mismatching XML therefore does NOT block training.
 # Unitree G1 source XMLs used to build the scenes (google-deepmind/mujoco_menagerie,
 # directory unitree_g1).  The directory itself is NOT tracked (38 MB); fetch it and
 # verify with:  sha256sum -c assets/g1_brachiation/menagerie_sha256.txt

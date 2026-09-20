@@ -115,9 +115,13 @@ MSG
     exit 1
 fi
 echo "   mesh subtree OK ($assets_hash)"
-( cd assets/g1_brachiation && sha256sum -c menagerie_sha256.txt >/dev/null 2>&1 ) \
-    || echo "   note: the upstream XMLs differ (only matters when REBUILDING the scene;" \
-            "the tracked scene_bars*.xml is what runs)"
+if ( cd assets/g1_brachiation && sha256sum -c menagerie_sha256.txt >/dev/null 2>&1 ); then
+    echo "   upstream XMLs match too"
+else
+    echo "   note: the upstream XMLs differ or are absent upstream (upstream may have"
+    echo "         renamed them).  They matter only when REBUILDING the scene; the tracked"
+    echo "         scene_bars*.xml is what actually runs, so training is unaffected."
+fi
 
 echo "== 4/5 rebuild the scene assets from source (pure MuJoCo, no GPU) =="
 "$PY" assets/g1_brachiation/build_scene.py --export /tmp/scene_bars_check.xml --spacing 0.40
