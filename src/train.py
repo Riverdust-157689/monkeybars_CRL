@@ -106,6 +106,14 @@ def parse() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="C_l2_infonce", choices=sorted(PRESETS))
     ap.add_argument("--impl", default="warp", choices=["jax", "warp"])
+    ap.add_argument("--gpu", type=int, default=-1,
+                    help="physical GPU index to use: sets CUDA_VISIBLE_DEVICES before "
+                         "jax/warp initialise (-1 = leave the environment alone).  JAX and "
+                         "MJX-Warp both enumerate devices through the CUDA runtime, so "
+                         "this one knob covers both; the selected GPU appears as cuda:0 "
+                         "to them.  One process = one GPU (the env is vmapped on a single "
+                         "device); for N GPUs start N processes with different --gpu / "
+                         "--exp-name / --checkpoint-dir / --seed.")
     ap.add_argument("--scene", default="full",
                     choices=["full", "full035", "mesh", "allprim"],
                     help="full = 0.40 m bar spacing (all earlier runs); full035 = same "
@@ -266,6 +274,10 @@ def main() -> int:
     # JAX reads this when it first initialises the GPU allocator, so it must be set
     # BEFORE any `import jax` (nothing above imports jax: mjx_backend only needs
     # numpy, and enable_warp_compat only imports warp).
+    # GPU selection must happen before ANY jax/warp import (both read the device list
+    # at initialisation), so it sits next to the XLA memory knob.
+    if args.gpu >= 0:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     if args.xla_mem_fraction > 0:
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(args.xla_mem_fraction)
 
@@ -345,6 +357,13 @@ def main() -> int:
         ev_instr = f"B{eval_kwargs.get('goal_bar')}"
     print(f"[goal] train instruction = {instr} | eval instruction = {ev_instr} "
           f"(envs={args.num_eval_envs}, naconmax={eval_kwargs['naconmax']})")
+    try:                                  # jax is imported by now (brax/jaxgcrl)
+        import jax as _jax
+        print(f"[gpu] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+              f"jax.devices()={_jax.devices()}")
+    except Exception as _exc:              # pragma: no cover
+        print(f"[gpu] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+              f"(devices not listed: {type(_exc).__name__})")
     print(f"[env] {train_env.backend} scene={args.scene} action={train_env.action_size} "
           f"obs={train_env.observation_size} state_dim={train_env.state_dim} "
           f"n_frames={args.n_frames} ({1/(args.n_frames*train_env.mj_model.opt.timestep):.0f} Hz) "
