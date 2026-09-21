@@ -101,6 +101,7 @@ class FeatureLayout(NamedTuple):
     hold_dual: slice       # same, for "both hands on the SAME bar"
     cnext: slice           # [c_L,gk, c_R,gk]: per-hand contact with the GOAL bar
     hnext: slice           # [h_L,gk, h_R,gk]: per-hand SUSTAINED contact with it
+    dnext: slice           # [d_L,gk, d_R,gk]: per-hand DISTANCE to it (metres)
     park: slice            # how long the torso has been parked under some bar
     cross: slice           # [p_R - p_B1 (3), c_{R,B1}, c_{L,B0}]  (only variant "cross")
     prev_action: slice
@@ -111,7 +112,7 @@ class FeatureLayout(NamedTuple):
 
 
 GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
-                 "dual_cnext", "dual_hnext", "park",
+                 "dual_cnext", "dual_hnext", "dual6c", "dual6d", "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
 # ---- M4.0 "advance one bar" ------------------------------------------------
@@ -150,6 +151,8 @@ K_SUSTAIN = 25
 # adds one more goal dimension, the *sustained-contact* feature (see HOLD_TAU).
 SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
                   "dual_cnext", "dual_hnext")
+# "dual6c"/"dual6d" are deliberately NOT in SUPPORT_FAMILY: their goal drops the
+# max(c)/h_any/h_dual block entirely (x,z + goal-bar per-hand terms only).
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
 # adds a second one, h_dual, for "both hands inside the SAME bar's window" (see
 # docs/M4_对与#11的分析和goal的设计问题的讨论.md 5).  The two together give the goal
@@ -169,7 +172,7 @@ DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext")
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_any, h_dual]      (12-D)
 # instead of max(c_L,c_R) = "at least one hand on SOME bar", which the start-bar
 # hang already satisfies and a single hand can satisfy alone.
-CNEXT_FAMILY = ("dual_cnext", "dual_hnext")
+CNEXT_FAMILY = ("dual_cnext", "dual_hnext", "dual6c")
 # "dual_hnext" (9.52) = dual_cnext with the two bar-AGNOSTIC persistence dims
 # h_any/h_dual replaced by per-hand, goal-bar-specific ones:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_L,gk, h_R,gk]      (12-D)
@@ -179,7 +182,21 @@ CNEXT_FAMILY = ("dual_cnext", "dual_hnext")
 # bar's window -- no loophole, and the passive "wait for h to grow" shortcut is
 # gone.  h_any/h_dual stay in the STATE as observable context (and metrics), just
 # not in the goal.
-HPAIR_FAMILY = ("dual_hnext",)
+HPAIR_FAMILY = ("dual_hnext", "dual6c", "dual6d")
+# "dual6c" / "dual6d" (9.54): the reduced 6-D goal -- torso (x,z) + per-hand
+# contact/distance with the goal bar + per-hand sustained contact:
+#   dual6c = [x, z, c_L,gk, c_R,gk, h_L,gk, h_R,gk]
+#   dual6d = [x, z, d_L,gk, d_R,gk, h_L,gk, h_R,gk]      (metres, linear)
+# p_L/p_R (6 world coordinates) leave the GOAL but stay in the STATE: the user's
+# point is that the per-hand goal-bar contact already says "hand on the goal bar",
+# at a far higher gain, so 6 more absolute coordinates are redundant in the goal.
+# The two differ ONLY in the contact encoding, which is the one-variable probe for
+# the 9.50/9.51 mechanism question: c = exp(-(d/0.04)^2) is ~0 with ~0 gradient
+# beyond ~10 cm (no reach direction), while d is linear.  In the SATURATED regime
+# d gives the approach direction the plan asks for ("per-hand distance, not the
+# saturating soft contact" -- see _advance_features), and c gives the grip magnitude
+# that run #18 showed to be load-bearing near the bar.
+DNEXT_FAMILY = ("dual6d",)
 # `hold = 1 - exp(-streak / HOLD_TAU)` where `streak` is the number of consecutive
 # steps with at least one hand inside the grasp window of some bar (< GRASP_THRESH,
 # the same criterion as bar_L/bar_R/max_bar -- NOT max(c) > 0.5, which would call a
@@ -259,6 +276,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     # per-hand contact with the GOAL bar (2 dims, "dual_cnext" only)
     cnext = nxt(2) if goal_variant in CNEXT_FAMILY else slice(i, i)
     hnext = nxt(2) if goal_variant in HPAIR_FAMILY else slice(i, i)
+    dnext = nxt(2) if goal_variant in DNEXT_FAMILY else slice(i, i)
     # "park": how long the TORSO has been inside some bar's hang box (history)
     park = nxt(1) if goal_variant == "park" else slice(i, i)
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
@@ -270,7 +288,14 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     kref = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
                     *(range(hand_pos.start, hand_pos.start + 6)))
-    if goal_variant == "full":
+    if goal_variant in ("dual6c", "dual6d"):
+        # [x, z, <goal-bar per-hand term>(2), h_L,gk, h_R,gk] -- note: NOT `_pos`,
+        # i.e. p_L/p_R are context-only for these variants.
+        terms = cnext if goal_variant == "dual6c" else dnext
+        goal_indices = (root_pos.start, root_pos.start + 2,
+                        terms.start, terms.start + 1,
+                        hnext.start, hnext.start + 1)
+    elif goal_variant == "full":
         goal_indices = goal_indices + (grasp_ind.start, grasp_ind.start + 1)
     elif goal_variant in SUPPORT_FAMILY:
         # "dual_nomax" deliberately does NOT put max(c_L,c_R) in the goal (it stays
@@ -304,8 +329,8 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         goal_indices = tuple(advance.start + k for k in range(6))
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
-                         grasp_support, hold, hold_dual, cnext, hnext, park, cross,
-                         prev_action,
+                         grasp_support, hold, hold_dual, cnext, hnext, dnext, park,
+                         cross, prev_action,
                          advance, kref, i, tuple(goal_indices))
 
 
@@ -385,6 +410,10 @@ class Brachiation(Env):
              "dual_cnext": _pos + [28, 29, 19, 20],
              # per-hand sustained contact with the goal bar (superset 28..31)
              "dual_hnext": _pos + [28, 29, 30, 31],
+             # reduced 6-D goals: NO hand positions, only x,z + the goal-bar terms
+             # (superset 28,29 = c_*,gk; 30,31 = h_*,gk; 32,33 = d_*,gk)
+             "dual6c": [0, 1, 28, 29, 30, 31],
+             "dual6d": [0, 1, 32, 33, 30, 31],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
              "park": [0, 1, 27],
              "position": list(_pos),
@@ -460,7 +489,8 @@ class Brachiation(Env):
                          + [0.0] * 6                           # advance block (all relative)
                          + [0.0,                               # park (settled = 1)
                             0.0, 0.0,                          # c_L,next / c_R,next = 1
-                            0.0, 0.0],                         # h_L,next / h_R,next = 1
+                            0.0, 0.0,                          # h_L,next / h_R,next = 1
+                            0.0, 0.0],                         # d_L,next / d_R,next = 0
                          dtype=np.float32)
         keep = np.asarray(self._goal_full_idx)
         if self.goal_variant in CROSS_FAMILY:
@@ -687,6 +717,8 @@ class Brachiation(Env):
             parts.append(self._cnext(d, k_goal))
         if self.goal_variant in HPAIR_FAMILY:
             parts.append(jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,)))
+        if self.goal_variant in DNEXT_FAMILY:
+            parts.append(self._dnext(d, k_goal))
         if self.goal_variant == "park":
             # only the parked streak is added: x_torso and z_torso are already
             # features 0 and 2 of the base block
@@ -753,7 +785,10 @@ class Brachiation(Env):
                                [1.0, 1.0],
                                # dual_hnext: both hands settled (sustained) on the
                                # goal bar -- the same 1.0 convention as h_any/h_dual
-                               [1.0, 1.0]]).astype(np.float32)
+                               [1.0, 1.0],
+                               # dual6d: the grasp seats sit ON the goal bar at the
+                               # canonical hang, so the per-hand distance is 0
+                               [0.0, 0.0]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -800,7 +835,8 @@ class Brachiation(Env):
             self._cnext(d, k_goal),                            # indices 28, 29
             # (2,) for every variant: the default is a scalar 0.0, and the
             # superset must keep a fixed shape for the non-"dual_hnext" cases
-            jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,))])   # 30, 31
+            jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,)),   # 30, 31
+            self._dnext(d, k_goal)])                           # indices 32, 33
         return full[self._goal_full_idx]
 
     def _cnext(self, d: jnp.ndarray, k_goal: jnp.ndarray) -> jnp.ndarray:
@@ -814,6 +850,16 @@ class Brachiation(Env):
                       self.n_bars - 1).astype(jnp.int32)
         return jnp.stack([jnp.exp(-(d[0, kg] / TAU_CONTACT) ** 2),
                           jnp.exp(-(d[1, kg] / TAU_CONTACT) ** 2)])
+
+    def _dnext(self, d: jnp.ndarray, k_goal: jnp.ndarray) -> jnp.ndarray:
+        """[d_L,gk, d_R,gk]: per-hand DISTANCE to the instruction goal bar (metres).
+
+        The linear counterpart of `_cnext`: unlike exp(-(d/tau)^2) it keeps a
+        gradient at any range, so it can drive a hand that starts far away.
+        """
+        kg = jnp.clip(jnp.rint(jnp.asarray(k_goal)), 0.0,
+                      self.n_bars - 1).astype(jnp.int32)
+        return jnp.stack([d[0, kg], d[1, kg]])
 
     def _hold_feature(self, streak: jnp.ndarray) -> jnp.ndarray:
         """Consecutive gripping steps -> the sustained-contact goal entry."""

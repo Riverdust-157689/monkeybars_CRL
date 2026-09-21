@@ -138,7 +138,8 @@ def main() -> int:
     uses_park = variant_cfg == "park"
     uses_hold = "hold" in variant_cfg and not uses_park
     uses_dual = variant_cfg in ("support_dual", "dual_nomax")
-    uses_cnext = variant_cfg in ("dual_cnext", "dual_hnext")
+    uses_cnext = variant_cfg in ("dual_cnext", "dual_hnext", "dual6c", "dual6d")
+    uses_hpair = variant_cfg in ("dual_hnext", "dual6c", "dual6d")
     uses_hpair = variant_cfg == "dual_hnext"
     if uses_cnext:
         if uses_hpair:
