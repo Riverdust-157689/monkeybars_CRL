@@ -141,8 +141,8 @@ def parse() -> argparse.Namespace:
                          "docs/执行计划.md")
     ap.add_argument("--goal-variant", default="full",
                     choices=["full", "support", "support_hold", "support_dual",
-                             "dual_nomax", "park", "position", "cross", "cross3",
-                             "hold2", "advance"],
+                             "dual_nomax", "dual_cnext", "park", "position",
+                             "cross", "cross3", "hold2", "advance"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
                          "support = [...,max(c_L,c_R)] (9-D, releasing ONE hand is free but "
                          "losing the last grip is penalised); support_hold = support + the "

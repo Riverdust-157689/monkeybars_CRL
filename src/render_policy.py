@@ -138,7 +138,11 @@ def main() -> int:
     uses_park = variant_cfg == "park"
     uses_hold = "hold" in variant_cfg and not uses_park
     uses_dual = variant_cfg in ("support_dual", "dual_nomax")
-    if uses_dual:
+    uses_cnext = variant_cfg == "dual_cnext"
+    if uses_cnext:
+        achieved = jax.jit(jax.vmap(lambda ps, h, hd, kg: env._achieved_goal(
+            ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd), 0.0, kg)))
+    elif uses_dual:
         achieved = jax.jit(jax.vmap(lambda ps, h, hd: env._achieved_goal(
             ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd))))
     elif uses_hold:
@@ -170,6 +174,11 @@ def main() -> int:
         if uses_park:
             diff = (np.asarray(achieved(s.pipeline_state, 0.0, 0.0, 0.0, 0.0,
                                         env._hold_feature(s.info["park_streak"])))
+                    - np.asarray(s.info["goal"]))
+        elif uses_cnext:
+            diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
+                                        s.info["dual_streak"],
+                                        s.info["k_goal"]))
                     - np.asarray(s.info["goal"]))
         elif uses_dual:
             diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
