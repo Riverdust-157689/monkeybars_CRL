@@ -2742,3 +2742,101 @@ d = 3.2 cm 处 ≈ **-21 /m**，而米制位置维是 1 /m ⇒ 同一个 3.2 cm 
 就是按这个标定的）。旁注：`TAU_GRASP = 0.05`（`_grasp` 里 softmax「是哪根杆」的温度）与
 `GRASP_THRESH = 0.05`（窗口）数值相同但作用不同，和 `TAU_CONTACT = 0.04`（软接触宽度）一起，
 三个常数都是 cm 量级。
+
+### 9.52 「全摊开」方案 `dual_hnext` + 一串基础事实的核对（用户提问）
+
+#### 9.52.1 goal 里的实际取值（代码核对，别再靠记忆）
+
+| 量 | 指令 goal（`goal_set[k]`）里的值 | 训练时（relabelled）|
+|---|---|---|
+| `x_torso` | `bar_x[k] - 0.0709`（**不是**杆的 x，是**躯干**悬挂时的 x）| 未来状态的 `qpos[0]` |
+| `z_torso` | `0.7743`（keyframe 躯干高度，**每根杆都一样**）| 未来状态的 `qpos[2]` |
+| `p_L/p_R` | `bar_x[k]`（抓握座标定在杆心，所以正好等于杆的 x）| 未来状态的座标 |
+| `c_*` | **1.0**（keyframe 对齐；稳态悬挂只有 0.47–0.52）| 未来状态的 `c` |
+| `h_any/h_dual` | **1.0**（「已经持续抓住」）| 未来状态的 `h` |
+
+实测：`goal x = [-0.0153, 0.3347, 0.6847, 1.0347, 1.3847]`，`bar_x = [0.0556, 0.4056, …]`，
+差值恒为 **-0.0709** ✓；`goal z` 恒为 0.7743 ✓。稳态悬挂实测 z = 0.7405（低 3.4 cm）、座离杆心 3.2 cm
+⇒ 这就是 §9.50/§9.51 里那些 0.03/0.48 缺口的来源。
+
+#### 9.52.2 三种「持续接触」的区别（用户提问）
+
+| 量 | 判据（连续 S 步）| 强度关系 | 会不会在**起始杆**上就满足 |
+|---|---|---|---|
+| `h_any` | ≥1 只手在**某根杆**的窗内 | 最弱 | **会**（吊 B0 时 0.918）|
+| `h_dual` | 两只手在**同一根杆**的窗内 | 中 | **会**（同杆 = B0）|
+| `h_L` / `h_R`（每手各一个）| 该手在**某根杆**窗内 | 中（`h_dual ⇒ (h_L,h_R) ⇒ h_any`）| 会 |
+| **`h_L,gk` / `h_R,gk`（本轮新增）** | 该手在**指令目标杆**的窗内 | 最强且**指向目标** | **不会**（吊 B0、goal B1 时 = 0）|
+
+前两者的“持续”是**杆无关**的，所以在起始杆上就已经接近满分（各 0.918），也会奖励「原地等着 h 长大」；
+`h_*,gk` 把这两条漏洞一起堵掉。
+
+#### 9.52.3 新变体 `dual_hnext`（用户的「全摊开」方案）
+
+```
+g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_L,gk, h_R,gk]       12 维, state 148 / obs 160
+goal_indices = (0, 2, 99..104, 130, 131, 132, 133)
+S_h  = 第 h 只手连续在 **gk 号杆** 5 cm 窗内的步数；h_h,gk = 1 - e^{-S_h/10}
+```
+
+`h_any`/`h_dual` **保留在 state 里**（可观测量 + 指标），只是**不进 goal**。CPU 实测（t=25，吊在 B0）：
+
+| goal | `c_L,gk` | `c_R,gk` | `h_L,gk` | `h_R,gk` | 四维占比 | `abs(diff)` |
+|---|---|---|---|---|---|---|
+| **B1**（吊在 B0）| **0.000** | **0.000** | **0.000** | **0.000** | **91.2%** | **2.093** |
+| **B0**（吊在目标杆下）| 0.474 | 0.524 | 0.918 | 0.918 | 99.3% | **0.721** |
+
+对比 `dual_cnext` 在同一状态（吊 B0 / goal B1）：`c` 两维为 0，但 `h_any`/`h_dual` 已是 0.918，各只占
+**1.5%** ⇒ 那两个「杆无关」维在错误杆上几乎白送。`dual_hnext` 把它们换成 0.000，目标在错杆上
+**没有任何一维是接近满足的**。
+
+**评估**：
+- 正面：① 终态表述变得完全明确（**每只手各自持续抓住目标杆**）；② 消除「等待 h 长大」的被动捷径与
+  「错杆白送」；③ `(c_L=1,c_R=0,h_L↑,h_R=0)` 这种**单手已抓住目标杆且持续**的中间态变得可表达，
+  正是 CRL 未来状态重标记最需要的量；④ 右手停在 B0 时 `h_R,gk` 恒 0 ⇒ **单手侧吸引子被直接惩罚**。
+- 代价/风险：目标**更难**（两维要求对目标杆持续 30+ 步），早期可能更容易掉进 evals 3–12 那个崩塌期；
+  引导必须靠 `c_*,gk` + `p(6)`（都是指向目标杆的）——这也是为什么不该同时把 `p(6)` 拿掉。
+- 阈值：同样要用 `--goal-reach-thresh 0.8`（吊在目标杆下实测 0.721；错杆 2.093）。
+- `x/z` 绝对值 vs 相对值：**在固定 B0→B1 下完全等价**（只差一个仿射平移），同意「没什么区别」；
+  绝对值只在放开随机起点时才重要（杆身份），而 run #12 的平移不变失败是前车之鉴 ⇒ 保留绝对值。
+
+#### 9.52.4 还没被证伪的一条：`max()` 会不会只是「学得慢」
+
+严格说，目前**不能**排除「给 #18 足够探索它也能学会过杆」：
+- 只有 1 个 seed，且两个成功 run（#13、#17）**同样**在 evals 3–12 崩过（`fell` 100%、len 40–130），
+  到 eval 12–15 才起飞；#18 也在 eval 10 短暂回到 len 409 / `dual_steps` 212，随后又落回去。
+- 能确定的只是「同预算（1.22e7 步）下 #18 远差、且末期趋势向下、`cov_b1_runmax` 恒 0」。
+- 另外要澄清一点：#18 的「伸手去够下一个杆」**不是** `h_any` 驱动的（`h_any` 只要求某根杆，
+  吊在 B0 就已经满足），而是 `x/z/p(6)` 这些**指向 B1 的几何维**驱动的——它确实够到了 B1 附近
+  （最近 1.8 cm），但从不停留。缺的不是「向目标迁移的量」，而是**让「抓住」这件事本身值得做的那一维**。
+- 想判定「慢还是不可能」，最干净的是把 `c_*,gk` 换成**线性**的每手到目标杆距离（`dual_dnext`，信息
+  完全相同、只去掉非线性/高增益）：能学会 ⇒ 关键是「每手 × 目标杆」这个引用方式；也崩 ⇒ 增益才是关键。
+
+#### 9.52.5 两臂对照命令（都与 #13 同预算 20 evals / 1.22e7 步）
+
+```bash
+.venv-warp/bin/python src/check_args.py && .venv-warp/bin/python src/check_metrics.py
+
+# GPU 0：只换 c（每手 × 目标杆），h 仍是 h_any/h_dual
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant dual_cnext --goal-reach-thresh 0.8 \
+  --train-goal-bar 1 --eval-goal-bar 1 --expl-hold 10 \
+  --num-evals 20 --steps 12200000 --save-every 5 \
+  --checkpoint-dir runs/ckpt_dual_cnext --impl warp --scene full035 --gpu 0 \
+  --wandb --exp-name brach_dual_cnext_b1 2>&1 \
+  | grep --line-buffered -v dot_search_space | tee runs/brach_dual_cnext_b1.log
+
+# GPU 1：c 与 h 都摊开（h_any/h_dual → h_L,gk/h_R,gk）
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant dual_hnext --goal-reach-thresh 0.8 \
+  --train-goal-bar 1 --eval-goal-bar 1 --expl-hold 10 \
+  --num-evals 20 --steps 12200000 --save-every 5 \
+  --checkpoint-dir runs/ckpt_dual_hnext --impl warp --scene full035 --gpu 1 \
+  --wandb --exp-name brach_dual_hnext_b1 2>&1 \
+  | grep --line-buffered -v dot_search_space | tee runs/brach_dual_hnext_b1.log
+```
+
+判据：`advance_max`/`max_bar` 是否越过 B1、`dual_runmax` 是否超过 #13 的 69.8 步、`fell` 是否远低于
+100%、`bar_L`/`bar_R` 是否**都**转正。

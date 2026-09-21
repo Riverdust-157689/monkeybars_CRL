@@ -138,10 +138,16 @@ def main() -> int:
     uses_park = variant_cfg == "park"
     uses_hold = "hold" in variant_cfg and not uses_park
     uses_dual = variant_cfg in ("support_dual", "dual_nomax")
-    uses_cnext = variant_cfg == "dual_cnext"
+    uses_cnext = variant_cfg in ("dual_cnext", "dual_hnext")
+    uses_hpair = variant_cfg == "dual_hnext"
     if uses_cnext:
-        achieved = jax.jit(jax.vmap(lambda ps, h, hd, kg: env._achieved_goal(
-            ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd), 0.0, kg)))
+        if uses_hpair:
+            achieved = jax.jit(jax.vmap(lambda ps, h, hd, kg, hp: env._achieved_goal(
+                ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd), 0.0, kg,
+                env._hold_feature(hp))))
+        else:
+            achieved = jax.jit(jax.vmap(lambda ps, h, hd, kg: env._achieved_goal(
+                ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd), 0.0, kg)))
     elif uses_dual:
         achieved = jax.jit(jax.vmap(lambda ps, h, hd: env._achieved_goal(
             ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd))))
@@ -176,10 +182,15 @@ def main() -> int:
                                         env._hold_feature(s.info["park_streak"])))
                     - np.asarray(s.info["goal"]))
         elif uses_cnext:
-            diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
-                                        s.info["dual_streak"],
-                                        s.info["k_goal"]))
-                    - np.asarray(s.info["goal"]))
+            if uses_hpair:
+                diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
+                                            s.info["dual_streak"], s.info["k_goal"],
+                                            s.info["hpair_streak"]))
+                        - np.asarray(s.info["goal"]))
+            else:
+                diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
+                                            s.info["dual_streak"], s.info["k_goal"]))
+                        - np.asarray(s.info["goal"]))
         elif uses_dual:
             diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
                                         s.info["dual_streak"]))

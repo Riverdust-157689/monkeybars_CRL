@@ -100,6 +100,7 @@ class FeatureLayout(NamedTuple):
     hold: slice            # sustained-contact feature 1-exp(-streak/HOLD_TAU)
     hold_dual: slice       # same, for "both hands on the SAME bar"
     cnext: slice           # [c_L,gk, c_R,gk]: per-hand contact with the GOAL bar
+    hnext: slice           # [h_L,gk, h_R,gk]: per-hand SUSTAINED contact with it
     park: slice            # how long the torso has been parked under some bar
     cross: slice           # [p_R - p_B1 (3), c_{R,B1}, c_{L,B0}]  (only variant "cross")
     prev_action: slice
@@ -110,7 +111,7 @@ class FeatureLayout(NamedTuple):
 
 
 GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
-                 "dual_cnext", "park",
+                 "dual_cnext", "dual_hnext", "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
 # ---- M4.0 "advance one bar" ------------------------------------------------
@@ -148,26 +149,37 @@ K_SUSTAIN = 25
 # "support" and "support_hold" share the max(c_L, c_R) state slot; "support_hold"
 # adds one more goal dimension, the *sustained-contact* feature (see HOLD_TAU).
 SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
-                  "dual_cnext")
+                  "dual_cnext", "dual_hnext")
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
 # adds a second one, h_dual, for "both hands inside the SAME bar's window" (see
 # docs/M4_对与#11的分析和goal的设计问题的讨论.md 5).  The two together give the goal
 # space an explicit three-layer structure -- flight (0,0) -> single support (1,0)
 # -> dual support (1,1) -- without constraining how the policy moves between them.
-HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext")
+HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
+               "dual_hnext")
 # "dual_nomax" = run #13's support_dual minus the instantaneous `max(c_L,c_R)`
 # entry (goal = [x, z, p_L(3), p_R(3), h_any, h_dual], 10-D).  The rationale above
 # was FALSIFIED by run #18 + CPU measurement (docs/M2_JaxGCRL接入记录.md 9.50):
 # that entry is not a saturating constant -- a settled hang reads 0.52 against a
 # goal of 1.0, the trained policy drives it to 0.96-0.98, and deleting it makes
 # training collapse (fell 100%, advance/succ stuck at 0).  Kept for the record.
-DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext")
+DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext")
 # "dual_cnext" (9.51) keeps a high-gain instantaneous contact term -- the measured
 # load-bearing part -- but makes it PER-HAND and aimed at the INSTRUCTION GOAL BAR:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_any, h_dual]      (12-D)
 # instead of max(c_L,c_R) = "at least one hand on SOME bar", which the start-bar
 # hang already satisfies and a single hand can satisfy alone.
-CNEXT_FAMILY = ("dual_cnext",)
+CNEXT_FAMILY = ("dual_cnext", "dual_hnext")
+# "dual_hnext" (9.52) = dual_cnext with the two bar-AGNOSTIC persistence dims
+# h_any/h_dual replaced by per-hand, goal-bar-specific ones:
+#   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_L,gk, h_R,gk]      (12-D)
+# h_any is satisfied by the *start* bar (0.92 while parked on B0 with the goal on
+# B1) and h_dual by any single bar, so both are "already 92% done" at t=0; they
+# also reward simply waiting.  h_h,gk only rises while THAT hand stays in the GOAL
+# bar's window -- no loophole, and the passive "wait for h to grow" shortcut is
+# gone.  h_any/h_dual stay in the STATE as observable context (and metrics), just
+# not in the goal.
+HPAIR_FAMILY = ("dual_hnext",)
 # `hold = 1 - exp(-streak / HOLD_TAU)` where `streak` is the number of consecutive
 # steps with at least one hand inside the grasp window of some bar (< GRASP_THRESH,
 # the same criterion as bar_L/bar_R/max_bar -- NOT max(c) > 0.5, which would call a
@@ -246,6 +258,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     hold_dual = nxt(1) if goal_variant in DUAL_FAMILY else slice(i, i)
     # per-hand contact with the GOAL bar (2 dims, "dual_cnext" only)
     cnext = nxt(2) if goal_variant in CNEXT_FAMILY else slice(i, i)
+    hnext = nxt(2) if goal_variant in HPAIR_FAMILY else slice(i, i)
     # "park": how long the TORSO has been inside some bar's hang box (history)
     park = nxt(1) if goal_variant == "park" else slice(i, i)
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
@@ -265,12 +278,17 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         if goal_variant != "dual_nomax" and goal_variant not in CNEXT_FAMILY:
             goal_indices = goal_indices + (grasp_support.start,)
         if goal_variant in CNEXT_FAMILY:
-            # order: [x, z, p(6), c_L,gk, c_R,gk, h_any, h_dual]
+            # order: [x, z, p(6), c_L,gk, c_R,gk, ...]
             goal_indices = goal_indices + (cnext.start, cnext.start + 1)
-        if goal_variant in HOLD_FAMILY:
-            goal_indices = goal_indices + (hold.start,)
-        if goal_variant in DUAL_FAMILY:
-            goal_indices = goal_indices + (hold_dual.start,)
+        if goal_variant in HPAIR_FAMILY:
+            # "dual_hnext": per-hand sustained contact with the GOAL bar replaces
+            # the bar-agnostic h_any/h_dual in the goal (they stay in the state).
+            goal_indices = goal_indices + (hnext.start, hnext.start + 1)
+        else:
+            if goal_variant in HOLD_FAMILY:
+                goal_indices = goal_indices + (hold.start,)
+            if goal_variant in DUAL_FAMILY:
+                goal_indices = goal_indices + (hold_dual.start,)
     elif goal_variant in CROSS_FAMILY:
         # indices INTO the state block: [0..2]=rel_pR, 3=d_RB1, 4=c_RB1, 5=c_LB0,
         # 6=c_LB1, 7=c_RB0
@@ -286,7 +304,8 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         goal_indices = tuple(advance.start + k for k in range(6))
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
-                         grasp_support, hold, hold_dual, cnext, park, cross, prev_action,
+                         grasp_support, hold, hold_dual, cnext, hnext, park, cross,
+                         prev_action,
                          advance, kref, i, tuple(goal_indices))
 
 
@@ -364,6 +383,8 @@ class Brachiation(Env):
              "dual_nomax": _pos + [19, 20],
              # per-hand contact with the goal bar (superset indices 28, 29)
              "dual_cnext": _pos + [28, 29, 19, 20],
+             # per-hand sustained contact with the goal bar (superset 28..31)
+             "dual_hnext": _pos + [28, 29, 30, 31],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
              "park": [0, 1, 27],
              "position": list(_pos),
@@ -438,7 +459,8 @@ class Brachiation(Env):
                          + [0.0, 0.0]                          # hold, hold_dual (settled)
                          + [0.0] * 6                           # advance block (all relative)
                          + [0.0,                               # park (settled = 1)
-                            0.0, 0.0],                         # c_L,next / c_R,next = 1
+                            0.0, 0.0,                          # c_L,next / c_R,next = 1
+                            0.0, 0.0],                         # h_L,next / h_R,next = 1
                          dtype=np.float32)
         keep = np.asarray(self._goal_full_idx)
         if self.goal_variant in CROSS_FAMILY:
@@ -644,7 +666,8 @@ class Brachiation(Env):
                         progress: jnp.ndarray = 0.0,
                         hold_dual: jnp.ndarray = 0.0,
                         park: jnp.ndarray = 0.0,
-                        k_goal: jnp.ndarray = 0.0) -> jnp.ndarray:
+                        k_goal: jnp.ndarray = 0.0,
+                        hnext: jnp.ndarray = 0.0) -> jnp.ndarray:
         d, w = self._grasp(data)
         dmin = d.min(axis=-1)
         c = jnp.exp(-(dmin / TAU_CONTACT) ** 2)          # soft "grasping" indicator
@@ -662,6 +685,8 @@ class Brachiation(Env):
                 parts.append(jnp.asarray(hold_dual)[None])
         if self.goal_variant in CNEXT_FAMILY:
             parts.append(self._cnext(d, k_goal))
+        if self.goal_variant in HPAIR_FAMILY:
+            parts.append(jnp.asarray(hnext))
         if self.goal_variant == "park":
             # only the parked streak is added: x_torso and z_torso are already
             # features 0 and 2 of the base block
@@ -725,6 +750,9 @@ class Brachiation(Env):
                                # so the seat coincides with the bar centre at t=0); a
                                # settled hang sits 3.2 cm off -> 0.52, which is exactly
                                # what makes this the highest-gain dim in the goal.
+                               [1.0, 1.0],
+                               # dual_hnext: both hands settled (sustained) on the
+                               # goal bar -- the same 1.0 convention as h_any/h_dual
                                [1.0, 1.0]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
@@ -745,7 +773,8 @@ class Brachiation(Env):
                        kref: jnp.ndarray = 0.0, progress: jnp.ndarray = 0.0,
                        hold_dual: jnp.ndarray = 0.0,
                        park: jnp.ndarray = 0.0,
-                       k_goal: jnp.ndarray = 0.0) -> jnp.ndarray:
+                       k_goal: jnp.ndarray = 0.0,
+                       hnext: jnp.ndarray = 0.0) -> jnp.ndarray:
         # `hold` means "the sustained-contact scalar this variant uses":
         #   support_hold -> at least one hand on ANY bar
         #   advance      -> at least one hand on the NEXT bar
@@ -768,7 +797,8 @@ class Brachiation(Env):
             jnp.asarray(hold_dual)[None],                      # index 20 (h_dual)
             self._advance_features(data, kref, hold, progress),   # indices 21..26
             jnp.asarray(park)[None],                           # index 27 (h_park)
-            self._cnext(d, k_goal)])                           # indices 28, 29
+            self._cnext(d, k_goal),                            # indices 28, 29
+            jnp.asarray(hnext)])                               # indices 30, 31
         return full[self._goal_full_idx]
 
     def _cnext(self, d: jnp.ndarray, k_goal: jnp.ndarray) -> jnp.ndarray:
@@ -837,6 +867,7 @@ class Brachiation(Env):
                 "dual_streak": jnp.zeros(()),
                 "park_streak": jnp.zeros(()),
                 "k_goal": jnp.zeros(()),        # instruction goal bar (dual_cnext)
+                "hpair_streak": jnp.zeros((2,)),  # per-hand sustained contact with it
                 **self._cov_zero_info()}
 
     # ------------------------------------------------------------------ #
@@ -901,7 +932,8 @@ class Brachiation(Env):
         obs = jnp.concatenate(
             [self._state_features(data, jnp.zeros(14), self._hold_feature(0.0), 0.0,
                                   0.0, self._hold_feature(0.0), self._hold_feature(0.0),
-                                  jnp.asarray(gk, dtype=jnp.float32)), goal])
+                                  jnp.asarray(gk, dtype=jnp.float32),
+                                  self._hold_feature(jnp.zeros((2,)))), goal])
         # JaxGCRL's evaluator hardcodes these five names:
         #   reward, success, success_easy, dist, distance_from_origin
         # (see jaxgcrl/utils/evaluator.py).  Everything else is our own.
@@ -971,6 +1003,15 @@ class Brachiation(Env):
         in_win = d < GRASP_THRESH
         dual_now = jnp.any(in_win[0] & in_win[1])
         dual_streak = jnp.where(dual_now, state.info["dual_streak"] + 1.0, 0.0)
+        # "dual_hnext": per-hand sustained contact with the GOAL bar.  Unlike
+        # h_any (satisfied by the start bar) and h_dual (any single bar), these
+        # only rise while THAT hand stays in the goal bar's window, so a robot
+        # parked on B0 scores 0 and there is no "wait for h to grow" shortcut.
+        kg_h = jnp.clip(jnp.rint(state.info["k_goal"]), 0.0,
+                        self.n_bars - 1).astype(jnp.int32)
+        in_goal = (d[:, kg_h] < GRASP_THRESH).astype(jnp.float32)
+        hpair_streak = jnp.where(in_goal > 0, state.info["hpair_streak"] + 1.0, 0.0)
+        hpair = self._hold_feature(hpair_streak)
         hold_dual = self._hold_feature(dual_streak)
         # h_park: consecutive steps with the TORSO inside some bar's hang box.  A
         # ballistic pass through the region lasts only a few steps, so a streak of
@@ -990,12 +1031,12 @@ class Brachiation(Env):
         # policy to keep going.
         progress = k_ref - state.info["k_start"]
         feats = self._state_features(data, action, hold, k_ref, progress, hold_dual,
-                                     h_park, state.info["k_goal"])
+                                     h_park, state.info["k_goal"], hpair)
         goal = state.info["goal"]
         obs = jnp.concatenate([feats, goal])
 
         achieved = self._achieved_goal(data, hold, k_ref, progress, hold_dual, h_park,
-                                       state.info["k_goal"])
+                                       state.info["k_goal"], hpair)
         dist = jnp.linalg.norm(achieved - goal)
         success = (dist < self.goal_reach_thresh).astype(jnp.float32)
         slow = jnp.linalg.norm(data.qvel) < 1.0
@@ -1039,6 +1080,7 @@ class Brachiation(Env):
         info.update(goal=goal, max_bar=max_bar, dwell=dwell, prev_bar=bar,
                     hold_streak=hold_streak, next_streak=next_streak,
                     dual_streak=dual_streak, park_streak=park_streak,
+                    hpair_streak=hpair_streak,
                     k_ref=k_ref, k_ref_run=k_run, k_ref_run_bar=k_run_bar,
                     kref_max=kref_max,
                     switches_total=(state.info.get("switches_total", jnp.zeros(()))
