@@ -106,6 +106,14 @@ def parse() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="C_l2_infonce", choices=sorted(PRESETS))
     ap.add_argument("--impl", default="warp", choices=["jax", "warp"])
+    ap.add_argument("--allow-cpu", action="store_true",
+                    help="allow training when JAX sees NO CUDA device.  Without this (and "
+                         "without JAX_PLATFORMS=cpu) a missing GPU is a fatal error: the "
+                         "usual cause is --gpu N with an index that does not exist (a "
+                         "single-GPU box has only 0, and --gpu 1 hides it via "
+                         "CUDA_VISIBLE_DEVICES), a driver that is not visible (no "
+                         "/dev/nvidia*), or JAX_PLATFORMS=cpu inherited from another shell "
+                         "-- all of which otherwise fall back to CPU *silently*.")
     ap.add_argument("--gpu", type=int, default=-1,
                     help="physical GPU index to use: sets CUDA_VISIBLE_DEVICES before "
                          "jax/warp initialise (-1 = leave the environment alone).  JAX and "
@@ -372,6 +380,27 @@ def main() -> int:
     except Exception as _exc:              # pragma: no cover
         print(f"[gpu] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
               f"(devices not listed: {type(_exc).__name__})")
+    # ---- refuse to train on CPU by accident --------------------------------
+    # JAX only *warns* when it cannot see a GPU, so a broken/mistaken device
+    # selection silently trains at ~1/100 speed.  Make it fatal unless CPU was
+    # asked for explicitly (JAX_PLATFORMS contains "cpu") or --allow-cpu is set.
+    try:
+        _backend = _jax.default_backend()
+    except Exception:                      # pragma: no cover
+        _backend = "unknown"
+    _explicit_cpu = "cpu" in os.environ.get("JAX_PLATFORMS", "").lower()
+    if _backend != "gpu" and not _explicit_cpu and not args.allow_cpu:
+        print("[gpu] FATAL: JAX sees no CUDA device -- refusing to train on CPU.")
+        print(f"      backend={_backend} CUDA_VISIBLE_DEVICES="
+              f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+              f"JAX_PLATFORMS={os.environ.get('JAX_PLATFORMS', '<unset>')}")
+        print("      most likely causes:")
+        print("        * --gpu N with a nonexistent index (single-GPU box => only --gpu 0;")
+        print("          --gpu 1 sets CUDA_VISIBLE_DEVICES=1 and hides the only GPU)")
+        print("        * driver not usable: check `nvidia-smi -L` and `ls -l /dev/nvidia*`")
+        print("        * JAX_PLATFORMS=cpu inherited from another shell (`unset JAX_PLATFORMS`)")
+        print("      if CPU really is intended: --allow-cpu (or JAX_PLATFORMS=cpu)")
+        raise SystemExit(3)
     print(f"[env] {train_env.backend} scene={args.scene} action={train_env.action_size} "
           f"obs={train_env.observation_size} state_dim={train_env.state_dim} "
           f"n_frames={args.n_frames} ({1/(args.n_frames*train_env.mj_model.opt.timestep):.0f} Hz) "

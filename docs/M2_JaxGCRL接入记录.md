@@ -3191,4 +3191,55 @@ ep1 更差：先向后荡（`qpos_x` 到 −0.18）再掉。
   --ckpt runs/ckpt_dual6c_b1/actor_latest.pkl --goal-bar 1 --episodes 2 --steps 260 \
   --lookat-x 0.25 --distance 2.6 --name render_dual6c_final`
 （产物：`runs/render/render_dual6c_final/{render_dual6c_final.gif, frames/step_%04d.png, trace.csv}`；
-关键帧：`0000` 双手 B0、`0015` 左手松开右手独撑、`0030` 左右手各一根杆、`0080` 即将打滑、`0100` 坠落。）
+关键帧：`0000` 双手 B0、`0015` 左手松开右手独撑、`0030` 左右手各一根杆、`0080` 即将打滑、`0100` 坠落。）### 9.56 `dual6d` 也失败（第三种失败形态）+ 一次「静默跑 CPU」事故与守卫
+
+`runs/brach_dual6d_b1`：20 evals / 1.22e7 步 / **6028 s**（1.68 h，跑在**本地单卡机 `Soil` 的 `--gpu 0`** 上）。
+`--goal-reach-thresh 0.35`（默认），goal = `[x, z, d_L,gk, d_R,gk, h_L,gk, h_R,gk]`（6 维）。
+
+| 指标（末 eval）| #13 `support_dual` | #19 `dual6c` | **#20 `dual6d`** |
+|---|---|---|---|
+| `succ` | 152.2 | 0 | **0** |
+| `advance_max` | 391.7 | 96.1（末）| **0.0（全 20 个 eval 恒 0）** |
+| `max_bar`（均值=杆号）| 0.97 | 0.90 | **0.18**（峰值 25.8，多数 episode 为 0）|
+| 离 B1 最近距离 | 0.002 m | **0.005 m** | **0.125 m**（末 eval 0.20 m）|
+| `dual_runmax` | 69.8 | 2.9 | 12.6（eval 18 曾到 69.8）|
+| `hand_on_steps/len` | 0.78 | 0.52 | 0.34 |
+| `fell`（末）| 6% | 100% | **100%** |
+| `categorical_accuracy`（末）| 0.185 | 0.140 | 0.116 |
+
+渲染（`runs/render/render_dual6d_final`，末期 ckpt，goal_bar=1）：`episode max bar = 0`
+（**从未离开 B0**）、`fell at [136, 149]`、离 B1 最近 **0.212 m**、
+**`grasping (soft) = L 0.15 R 0.12`**（对照 #17 是 0.88/0.87）、`hand_switches` 17/20（反复重抓）。
+
+⇒ 三种失败形态互不相同，但都指向同一件事：
+
+* `dual6c`（有 `c`/`h`、无 `p`）：**单手够到并短暂抓住 B1**（5 mm），另一只手没有梯度 ⇒ 卡在单手；
+* `dual6d`（线性 `d`/`h`、无 `p`、无 `c`）：**根本不尝试转移**（`advance_max` 恒 0），
+  手滑着挂在 B0 上反复重抓（soft grasp 仅 0.15）⇒ 最终坠落；
+* `dual_nomax`（有 `p`、无 `c`）：够得着但**没有"抓住"的理由** ⇒ 松手坠落。
+
+⇒ **"把 `p(6)` 移出 goal" 这条线到此为止**（`dual6c`、`dual6d` 都失败，`dual6d` 已标为证伪）。
+下一步只跑**保留 `p(6)`**、只改接触项参照方式的 `dual_cnext` / `dual_hnext`（12 维，§9.55.2）。
+
+#### 9.56.1 事故：`--gpu 1` 在单卡机上导致「静默跑 CPU」
+
+本地机 `firedust@Soil` 上跑 `--gpu 1` 时：`--gpu 1` 会设 `CUDA_VISIBLE_DEVICES=1`，
+而该机**只有一张卡（索引 0）** ⇒ 把唯一的 GPU 藏起来 ⇒
+`cuInit(0) failed: CUDA_ERROR_NO_DEVICE` ⇒ JAX **只打印一行 warning 就回退 CPU 并开始训练**。
+日志里唯一的判据是：
+
+```
+[gpu] CUDA_VISIBLE_DEVICES=1 jax.devices()=[CpuDevice(id=0)]
+```
+
+它没有崩，所以不注意就会在 CPU 上白跑（那次是 `^C` 手动停的）。
+反证：同一台机器把 `--gpu` 换成 **0** 后，`dual6d` 正常跑完（1.68 h）⇒ **GPU 与驱动本身没问题**。
+
+**据此给 `train.py` 加了硬性守卫**（提交见本次改动）：JAX 后端不是 GPU、且**没有显式声明** CPU
+（`JAX_PLATFORMS` 不含 `cpu`）、也没有 `--allow-cpu` 时，直接 **`SystemExit(3)`**，并打印三类常见原因
+（`--gpu` 索引不存在、驱动/设备不可见、`JAX_PLATFORMS=cpu` 被别的 shell 继承）。两条路径都实测过：
+
+* `JAX_PLATFORMS=cpu` + 同样的配置 ⇒ 放行（打印 `[gpu] CUDA_VISIBLE_DEVICES=<unset> jax.devices()=[CpuDevice(id=0)]`）；
+* 未声明 CPU + `--gpu 0`（驱动不可见时）⇒ `[gpu] FATAL: ... refusing to train on CPU.` 且**退出码 3**。
+
+⇒ 以后 GPU 运行前的判据不变（看 `[gpu]` 那行的 `CudaDevice`），但现在**忘了看也会被拦下来**。
