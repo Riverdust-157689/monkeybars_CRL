@@ -686,7 +686,7 @@ class Brachiation(Env):
         if self.goal_variant in CNEXT_FAMILY:
             parts.append(self._cnext(d, k_goal))
         if self.goal_variant in HPAIR_FAMILY:
-            parts.append(jnp.asarray(hnext))
+            parts.append(jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,)))
         if self.goal_variant == "park":
             # only the parked streak is added: x_torso and z_torso are already
             # features 0 and 2 of the base block
@@ -798,7 +798,9 @@ class Brachiation(Env):
             self._advance_features(data, kref, hold, progress),   # indices 21..26
             jnp.asarray(park)[None],                           # index 27 (h_park)
             self._cnext(d, k_goal),                            # indices 28, 29
-            jnp.asarray(hnext)])                               # indices 30, 31
+            # (2,) for every variant: the default is a scalar 0.0, and the
+            # superset must keep a fixed shape for the non-"dual_hnext" cases
+            jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,))])   # 30, 31
         return full[self._goal_full_idx]
 
     def _cnext(self, d: jnp.ndarray, k_goal: jnp.ndarray) -> jnp.ndarray:

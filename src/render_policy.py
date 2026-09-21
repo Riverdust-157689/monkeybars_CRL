@@ -226,10 +226,10 @@ def main() -> int:
     print(f"[result] episode max bar = {run_max[-1].astype(int).tolist()}   (0 = never left B0)")
     print(f"[result] fell at step    = {fell_at}   (-1 = survived the episode)")
     print(f"[result] goal dist       = {rec['dist'][0].mean():.3f} -> {rec['dist'][-1].mean():.3f} "
-          f"(10-dim)   [position-only 8-dim: {rec['dist_pos'][0].mean():.3f} -> "
+          f"({len(env.goal_indices)}-dim)   [position-only 8-dim: {rec['dist_pos'][0].mean():.3f} -> "
           f"{rec['dist_pos'][-1].mean():.3f}]")
     print(f"[result] torso x         = {qpos[0, :, 0].mean():+.3f} -> {qpos[-1, :, 0].mean():+.3f} m "
-          f"(bar spacing 0.4 m)")
+          f"(bar spacing {env.bar_spacing:.3f} m)")
     print(f"[result] torso z         = {qpos[0, :, 2].mean():.3f} -> {qpos[-1, :, 2].mean():.3f} m")
     print(f"[result] hand switches   = {rec['switched'].sum(axis=0).astype(int).tolist()} per episode")
     if "d_LB1" in rec:
