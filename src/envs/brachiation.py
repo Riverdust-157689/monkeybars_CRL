@@ -371,7 +371,10 @@ class Brachiation(Env):
         reset_noise_leg: float = 0.02,
         reset_noise_vel: float = 0.02,
         goal_bar: Optional[int] = None,      # None -> sample per episode
-        goal_bar_min: int = 0,               # sampling range is [goal_bar_min, n_bars)
+        goal_bar_min: int = 0,               # sampling range is [goal_bar_min, goal_bar_max]
+        goal_bar_max: int = -1,              # -1 -> n_bars-1.  With start_bar_max > 0 the
+                                             # sampled goal is kept STRICTLY AHEAD of the
+                                             # start bar (see the curriculum in 9.68).
         goal_variant: str = "full",          # "full" | "support" | "position" (see default_layout)
         action_window: str = "reach",        # "m1" (old, cannot express a reach) | "reach"
         goal_reach_thresh: float = 0.35,
@@ -539,6 +542,8 @@ class Brachiation(Env):
                 np.stack([goal0 + k * shift for k in range(self.n_bars)])[:, keep])
         self.goal_bar = goal_bar
         self.goal_bar_min = int(goal_bar_min)
+        self.goal_bar_max = (self.n_bars - 1 if int(goal_bar_max) < 0
+                             else int(goal_bar_max))
         # Starting-bar randomisation is only meaningful for the bar-independent
         # "advance" goal: every other variant's goal_set is pinned to absolute bar
         # coordinates, so shifting the start would make it unreachable.
@@ -552,6 +557,16 @@ class Brachiation(Env):
         if self.goal_ahead and self.goal_bar is not None:
             raise ValueError("goal_ahead requires a sampled goal bar "
                              "(train.py: --train-goal-bar -1)")
+        if self.goal_bar_max < self.goal_bar_min:
+            raise ValueError(f"goal_bar_max ({self.goal_bar_max}) < "
+                             f"goal_bar_min ({self.goal_bar_min})")
+        if (self.goal_bar is None and self.start_bar_max > 0
+                and self.goal_bar_max < self.start_bar_max + 1):
+            # every k0 in {0..start_bar_max} must have at least one bar ahead of it
+            raise ValueError(
+                f"with start_bar_max={self.start_bar_max} the sampled goal must be "
+                f"strictly ahead of the start, so goal_bar_max must be >= "
+                f"{self.start_bar_max + 1}; got {self.goal_bar_max}")
         if self.goal_ahead and self.start_bar_max > self.n_bars - 2:
             # starting on the last bar leaves no bar ahead -> the goal would equal
             # the start (a trivially satisfied episode)
@@ -985,7 +1000,8 @@ class Brachiation(Env):
                 # goal bar strictly AFTER the bar this episode started on (M4:
                 # "start anywhere in the first N-1 bars, the goal is any later bar")
                 k0i = k0.astype(jnp.int32)
-                span = jnp.maximum(self.n_bars - 1 - k0i, 1)
+                span = jnp.maximum(
+                    jnp.minimum(self.n_bars - 1 - k0i, self.goal_bar_max - k0i), 1)
                 if self.goal_ahead_max > 0:
                     # cap the distance: --goal-ahead-max 1 means "the goal is ALWAYS
                     # exactly the next bar", i.e. a uniformly difficult, always
@@ -995,7 +1011,13 @@ class Brachiation(Env):
                 gk = jnp.minimum(k0i + 1 + jax.random.randint(rng_goal_sel, (), 0, span),
                                  self.n_bars - 1)
             else:
-                gk = jax.random.randint(rng_goal, (), self.goal_bar_min, self.n_bars)
+                # curriculum support (9.68): with a randomized start the instruction
+                # is restricted to [max(min, k0+1), goal_bar_max], so e.g.
+                # start_bar_max=1 + min=1 + max=2 yields exactly {B0->B1, B0->B2, B1->B2}.
+                lo = self.goal_bar_min
+                if self.start_bar_max > 0:
+                    lo = jnp.maximum(lo, k0.astype(jnp.int32) + 1)
+                gk = jax.random.randint(rng_goal, (), lo, self.goal_bar_max + 1)
         else:
             gk = jnp.asarray(self.goal_bar)
         goal = self.goal_set[gk]

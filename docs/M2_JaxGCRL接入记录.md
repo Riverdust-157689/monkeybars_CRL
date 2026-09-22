@@ -3617,4 +3617,53 @@ CPU 校验（t=25 稳态悬挂）：
 * `dual_hnext_max`：右手 soft grasp 从 0.12 升到 ≳0.7、双持占比从 13% 升到 **>70%**、`hand_switches` 下降
   ⇒ 角色 ② 成立（抓握深度是终态稳定的关键）。
 * `dual_hnext_dual`：双持占比升到 **≳80%**，但右手 soft grasp 仍偏低（"摸到即松"）⇒ 角色 ③ 成立。
-* 若**两者都只升到 ~30%**，说明真正的推手是 #17 里两者的**组合**（或 `h_any`），需要再设计。
+* 若**两者都只升到 ~30%**，说明真正的推手是 #17 里两者的**组合**（或 `h_any`），需要再设计。### 9.68 两杆课程：`--train-goal-bar-max`（用户提议的三种 episode）
+
+用户提议：训练集应包含 **B0→B1、B1→B2、B0→B2** 三种 episode。原来表达不出来——
+`--goal-ahead 1 --goal-ahead-max 1` 只能给前两种，`--goal-ahead-max 2` 又多出 B1→B3；
+而且**随机起点 + 采样目标**在旧代码里允许采到"身后"的杆。
+
+**改动**（`src/envs/brachiation.py` + `src/train.py`）：
+
+* 新增 `--train-goal-bar-max`（含端点，`-1` = `n_bars-1`）；
+* **当 `start_bar_max > 0` 时，采样区间收窄为 `[max(goal_bar_min, k0+1), goal_bar_max]`**
+  ⇒ 指令**恒在起点之后**（消除了"朝后目标"这个隐患，见 §9.45/§9.50）；
+* `--goal-ahead` 分支的 `span` 也按 `goal_bar_max` 收窄；构造环境时若
+  `goal_bar_max < start_bar_max + 1` 直接报错（不可能满足"恒朝前"）；
+* `args.json` 现在记录 `start_bar_max / train_goal_bar_min / train_goal_bar_max`。
+
+**实测分布**（256 次 reset，`support_dual`）：
+
+| 配置 | 分布 | 朝后目标 |
+|---|---|---|
+| **`--start-bar-max 1 --train-goal-bar-min 1 --train-goal-bar-max 2`** | **B0→B1: 57 / B0→B2: 70 / B1→B2: 129** | **0/256** |
+| `--start-bar-max 0 --train-goal-bar-min 1`（旧行为）| B0→{B1..B4} 各 ~64 | 0 |
+| `--start-bar-max 1 --goal-ahead 1 --goal-ahead-max 1`（旧的"只差一格"）| B0→B1 / B1→B2 | 0 |
+| `--start-bar-max 1 --train-goal-bar-min 1`（无 max）| B0→{B1..B4} / B1→{B2..B4} | 0（新逻辑已强制朝前）|
+
+守卫：`check_args` / `check_metrics` / `check_variants`（17 变体）全过。
+
+**为什么这个课程有道理**：起点在 B1 的 episode 与起点在 B0 的**物理完全同构**（reset 只是把整机平移
+`k0·spacing`，代码注释里已注明"bit-identical physics"）⇒ 策略因此看到同一套转移技能的多个"位置副本"，
+而 B0→B2 那类 episode 正好提供**两格链式**的状态分布（这正是"连续过多杆"要的东西）。
+注意训练期 actor 的 goal 输入取自**未来状态重标记**，指令只体现在 `goal_set[gk]`（绝对坐标 ⇒ 目标身份
+因此是可区分的）。
+
+**命令（1.5 h 侦察，20 evals；#17 配方一字不改，只加课程三个 flag）**：
+
+```bash
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce --num-envs 128 \
+  --num-eval-envs 16 --batch-size 512 --min-replay-size 1000 --unroll-length 62 \
+  --action-window reach --goal-variant support_dual \
+  --start-bar-max 1 --train-goal-bar-min 1 --train-goal-bar-max 2 \
+  --eval-goal-bar 1 --expl-hold 10 \
+  --num-evals 20 --steps 12200000 --save-every 5 \
+  --buffer-gb 1.0 --xla-mem-fraction 0.6 \
+  --checkpoint-dir runs/ckpt_dual2bar --impl warp --scene full035 --gpu 0 \
+  --wandb --exp-name brach_dual2bar 2>&1 \
+  | grep --line-buffered -v -e dot_search_space -e autotuning | tee runs/brach_dual2bar.log
+```
+
+**判据**：eval 固定在 B1（与 #13/#17 可比）⇒ 看 B0→B1 的技能有没有被课程破坏（`dual_runmax`/`bar_R`/`fell`）；
+再看 `max_bar` 是否 >1（链到第二格的迹象）。跑完用 `render_policy.py --goal-bar 2` 回放，
+直接看它对"去 B2"这个指令的反应（渲染可以自由改指令，训练不能）。

@@ -137,6 +137,12 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--train-goal-bar-min", type=int, default=0,
                     help="training instruction goals are sampled uniformly from "
                          "[min, 5); set 1 to exclude B0 (= the bar the robot starts on)")
+    ap.add_argument("--train-goal-bar-max", type=int, default=-1,
+                    help="upper end of the sampled instruction bar (inclusive; -1 = n_bars-1). "
+                         "Use with --start-bar-max to build a curriculum, e.g. "
+                         "--start-bar-max 1 --train-goal-bar-min 1 --train-goal-bar-max 2 gives "
+                         "the three episode types {B0->B1, B0->B2, B1->B2} (the goal is always "
+                         "kept strictly ahead of the start bar).")
     ap.add_argument("--train-goal-bar", type=int, default=-1,
                     help="FIXED training instruction goal (e.g. 1 = always 'go to B1'); "
                          "-1 = sample per episode using --train-goal-bar-min. "
@@ -315,6 +321,7 @@ def main() -> int:
         print(f"[warn] --goal-position-only overrides --goal-variant {args.goal_variant}")
     env_kwargs = dict(impl=args.impl, scene=args.scene, n_frames=args.n_frames,
                       goal_bar_min=args.train_goal_bar_min,
+                      goal_bar_max=args.train_goal_bar_max,
                       goal_reach_thresh=args.goal_reach_thresh,
                       goal_variant=goal_variant,
                       action_window=args.action_window,
@@ -370,7 +377,8 @@ def main() -> int:
         ev_instr = "same single goal"
     else:
         instr = (f"FIXED B{env_kwargs.get('goal_bar')}" if args.train_goal_bar >= 0
-                 else f"U[{args.train_goal_bar_min}, {train_env.n_bars})")
+                 else f"U[{args.train_goal_bar_min}, {train_env.goal_bar_max}]"
+                      f"{' strictly ahead of start' if args.start_bar_max > 0 else ''}")
         ev_instr = f"B{eval_kwargs.get('goal_bar')}"
     print(f"[goal] train instruction = {instr} | eval instruction = {ev_instr} "
           f"(envs={args.num_eval_envs}, naconmax={eval_kwargs['naconmax']})")
@@ -506,6 +514,9 @@ def main() -> int:
                            goal_variant=str(train_env.goal_variant),
                            goal_size=int(train_env.goal_size),
                            action_window=str(train_env.action_window),
+                           start_bar_max=int(args.start_bar_max),
+                           train_goal_bar_min=int(args.train_goal_bar_min),
+                           train_goal_bar_max=int(train_env.goal_bar_max),
                            git_commit=str(args.git_commit)),
 
         }
