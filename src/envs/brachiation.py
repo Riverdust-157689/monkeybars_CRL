@@ -112,7 +112,8 @@ class FeatureLayout(NamedTuple):
 
 
 GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
-                 "dual_cnext", "dual_hnext", "dual6c", "dual6d", "park",
+                 "dual_cnext", "dual_hnext", "dual_hnext_max", "dual_hnext_dual",
+                 "dual6c", "dual6d", "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
 # ---- M4.0 "advance one bar" ------------------------------------------------
@@ -150,7 +151,11 @@ K_SUSTAIN = 25
 # "support" and "support_hold" share the max(c_L, c_R) state slot; "support_hold"
 # adds one more goal dimension, the *sustained-contact* feature (see HOLD_TAU).
 SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
-                  "dual_cnext", "dual_hnext")
+                  "dual_cnext", "dual_hnext",
+                  # 9.66: these两个 = dual_hnext + 恰好一维（角色 2 / 角色 3）。
+                  # 进 SUPPORT_FAMILY 只是为了拿到 max(c) 的 state 槽（dua_hnext_max
+                  # 需要它作为 goal 项；dual_hnext_dual 只把它当可观测量）。
+                  "dual_hnext_max", "dual_hnext_dual")
 # "dual6c"/"dual6d" are deliberately NOT in SUPPORT_FAMILY: their goal drops the
 # max(c)/h_any/h_dual block entirely (x,z + goal-bar per-hand terms only).
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
@@ -166,13 +171,15 @@ HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
 # that entry is not a saturating constant -- a settled hang reads 0.52 against a
 # goal of 1.0, the trained policy drives it to 0.96-0.98, and deleting it makes
 # training collapse (fell 100%, advance/succ stuck at 0).  Kept for the record.
-DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext")
+DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext",
+               "dual_hnext_dual")
 # "dual_cnext" (9.51) keeps a high-gain instantaneous contact term -- the measured
 # load-bearing part -- but makes it PER-HAND and aimed at the INSTRUCTION GOAL BAR:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_any, h_dual]      (12-D)
 # instead of max(c_L,c_R) = "at least one hand on SOME bar", which the start-bar
 # hang already satisfies and a single hand can satisfy alone.
-CNEXT_FAMILY = ("dual_cnext", "dual_hnext", "dual6c")
+CNEXT_FAMILY = ("dual_cnext", "dual_hnext", "dual6c",
+                "dual_hnext_max", "dual_hnext_dual")
 # "dual_hnext" (9.52) = dual_cnext with the two bar-AGNOSTIC persistence dims
 # h_any/h_dual replaced by per-hand, goal-bar-specific ones:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_L,gk, h_R,gk]      (12-D)
@@ -182,7 +189,13 @@ CNEXT_FAMILY = ("dual_cnext", "dual_hnext", "dual6c")
 # bar's window -- no loophole, and the passive "wait for h to grow" shortcut is
 # gone.  h_any/h_dual stay in the STATE as observable context (and metrics), just
 # not in the goal.
-HPAIR_FAMILY = ("dual_hnext", "dual6c", "dual6d")
+HPAIR_FAMILY = ("dual_hnext", "dual6c", "dual6d",
+                "dual_hnext_max", "dual_hnext_dual")
+# "dual_hnext_max"  = dual_hnext + max(c_L,c_R)（任意杆的抓握质量，§9.66 角色 2）
+# "dual_hnext_dual" = dual_hnext + h_dual（同杆双手持续，§9.66 角色 3）
+# 两者都只比 dual_hnext 多 1 维，见 9.66 的分工表。
+HMAX_FAMILY = ("dual_hnext_max",)
+HDMAX_FAMILY = ("dual_hnext_dual",)
 # "dual6c" / "dual6d" (9.54): the reduced 6-D goal -- torso (x,z) + per-hand
 # contact/distance with the goal bar + per-hand sustained contact:
 #   dual6c = [x, z, c_L,gk, c_R,gk, h_L,gk, h_R,gk]
@@ -288,7 +301,17 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     kref = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
                     *(range(hand_pos.start, hand_pos.start + 6)))
-    if goal_variant in ("dual6c", "dual6d"):
+    if goal_variant in HMAX_FAMILY:
+        # [x, z, p(6), max(c), c_L,gk, c_R,gk, h_L,gk, h_R,gk]   (13)
+        goal_indices = goal_indices + (grasp_support.start,
+                                       cnext.start, cnext.start + 1,
+                                       hnext.start, hnext.start + 1)
+    elif goal_variant in HDMAX_FAMILY:
+        # [x, z, p(6), c_L,gk, c_R,gk, h_L,gk, h_R,gk, h_dual]   (13)
+        goal_indices = goal_indices + (cnext.start, cnext.start + 1,
+                                       hnext.start, hnext.start + 1,
+                                       hold_dual.start)
+    elif goal_variant in ("dual6c", "dual6d"):
         # [x, z, <goal-bar per-hand term>(2), h_L,gk, h_R,gk] -- note: NOT `_pos`,
         # i.e. p_L/p_R are context-only for these variants.
         terms = cnext if goal_variant == "dual6c" else dnext
@@ -412,6 +435,9 @@ class Brachiation(Env):
              "dual_hnext": _pos + [28, 29, 30, 31],
              # reduced 6-D goals: NO hand positions, only x,z + the goal-bar terms
              # (superset 28,29 = c_*,gk; 30,31 = h_*,gk; 32,33 = d_*,gk)
+             # 9.66: dual_hnext 各加一维（10 = max(c)，20 = h_dual）
+             "dual_hnext_max": _pos + [10, 28, 29, 30, 31],
+             "dual_hnext_dual": _pos + [28, 29, 30, 31, 20],
              "dual6c": [0, 1, 28, 29, 30, 31],
              "dual6d": [0, 1, 32, 33, 30, 31],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
