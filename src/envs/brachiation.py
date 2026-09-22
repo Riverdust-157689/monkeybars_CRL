@@ -567,6 +567,32 @@ class Brachiation(Env):
                 f"with start_bar_max={self.start_bar_max} the sampled goal must be "
                 f"strictly ahead of the start, so goal_bar_max must be >= "
                 f"{self.start_bar_max + 1}; got {self.goal_bar_max}")
+        # ---- curriculum table (9.68.1) --------------------------------------
+        # With a randomised start we sample the DISTANCE first and the start second:
+        #   * delta ~ U over the feasible distances,
+        #   * k0    ~ U over the starts that admit that delta.
+        # This is what makes the mixture sensible: for the two-bar curriculum
+        # (start<=1, goal in [1,2]) delta=1 admits k0 in {0,1} and delta=2 only k0=0,
+        # so the episode types come out as B0->B2 50% / B0->B1 25% / B1->B2 25%.
+        # (The previous k0-first scheme gave B1->B2 50%, which over-weights the
+        # *second* one-bar copy and under-weights the chaining case.)
+        self._delta, self._klo, self._khi = [], [], []
+        if self.goal_bar is None and self.start_bar_max > 0:
+            _dmax = self.goal_bar_max
+            if self.goal_ahead and self.goal_ahead_max > 0:
+                _dmax = min(_dmax, self.goal_ahead_max)
+            for _d in range(1, _dmax + 1):
+                _lo = max(0, self.goal_bar_min - _d)
+                _hi = min(self.start_bar_max, self.goal_bar_max - _d)
+                if _lo <= _hi:
+                    self._delta.append(_d); self._klo.append(_lo); self._khi.append(_hi)
+            if not self._delta:
+                raise ValueError(
+                    f"no feasible (start, goal) pair for start_bar_max={self.start_bar_max}, "
+                    f"goal_bar_min={self.goal_bar_min}, goal_bar_max={self.goal_bar_max}")
+            self._delta = jnp.asarray(self._delta, jnp.int32)
+            self._klo = jnp.asarray(self._klo, jnp.int32)
+            self._khi = jnp.asarray(self._khi, jnp.int32)
         if self.goal_ahead and self.start_bar_max > self.n_bars - 2:
             # starting on the last bar leaves no bar ahead -> the goal would equal
             # the start (a trivially satisfied episode)
@@ -981,10 +1007,20 @@ class Brachiation(Env):
         # any later bar" distribution silently collapsed to "exactly the next bar".
         rng_bar, rng_goal_sel = jax.random.split(rng_goal)
         k0 = jnp.zeros(())          # bar the episode starts on (0 unless randomised)
+        gk_sample = None            # set here when the curriculum table is used
         if self.start_bar_max > 0:
             # The bars are periodic, so "start on bar k" is just a translation of the
             # whole robot by k * spacing -- bit-identical physics, no new asset.
-            k0 = jax.random.randint(rng_bar, (), 0, self.start_bar_max + 1).astype(jnp.float32)
+            if self.goal_bar is None:
+                # delta-first curriculum sampling (see the table built in __init__)
+                i = jax.random.randint(rng_goal_sel, (), 0, self._delta.shape[0])
+                d = jnp.take(self._delta, i)
+                lo, hi = jnp.take(self._klo, i), jnp.take(self._khi, i)
+                k0 = jax.random.randint(rng_bar, (), lo, hi + 1).astype(jnp.float32)
+                gk_sample = k0.astype(jnp.int32) + d
+            else:
+                k0 = jax.random.randint(rng_bar, (), 0,
+                                        self.start_bar_max + 1).astype(jnp.float32)
             qpos = qpos.at[0].add(k0 * self.bar_spacing)
         qvel = nv * jax.random.normal(rng_vel, (self.mj_model.nv,))
 
@@ -1010,14 +1046,11 @@ class Brachiation(Env):
                     span = jnp.minimum(span, self.goal_ahead_max)
                 gk = jnp.minimum(k0i + 1 + jax.random.randint(rng_goal_sel, (), 0, span),
                                  self.n_bars - 1)
+            elif gk_sample is not None:
+                # already drawn together with k0 (delta-first curriculum sampling)
+                gk = gk_sample
             else:
-                # curriculum support (9.68): with a randomized start the instruction
-                # is restricted to [max(min, k0+1), goal_bar_max], so e.g.
-                # start_bar_max=1 + min=1 + max=2 yields exactly {B0->B1, B0->B2, B1->B2}.
-                lo = self.goal_bar_min
-                if self.start_bar_max > 0:
-                    lo = jnp.maximum(lo, k0.astype(jnp.int32) + 1)
-                gk = jax.random.randint(rng_goal, (), lo, self.goal_bar_max + 1)
+                gk = jax.random.randint(rng_goal, (), self.goal_bar_min, self.goal_bar_max + 1)
         else:
             gk = jnp.asarray(self.goal_bar)
         goal = self.goal_set[gk]
