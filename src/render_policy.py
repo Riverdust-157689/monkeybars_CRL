@@ -159,6 +159,19 @@ def main() -> int:
     rec = {k: np.zeros((T + 1, E), dtype=np.float32)
            for k in ("dist", "dist_pos", "c_L", "c_R", "bar_L", "bar_R", "done", "switched",
                      "d_LB1", "d_RB1")}
+    # "alive at the START of this step", i.e. the live-phase mask (see below).
+    # It must be recorded per step: `ever_done` is only the CURRENT accumulator
+    # (shape (E,)), so masking with it afterwards silently collapses to the final
+    # all-fallen vector.
+    rec["live"] = np.zeros((T + 1, E), dtype=np.float32)
+    # 9.72: the contact family's whole question is "is the hand on the instructed
+    # bar HOVERING (in the window, no load) or really GRIPPING (carrying load)?"
+    # -- so record the load and the two gates, not just the distance.
+    uses_contact = "contact" in variant
+    if uses_contact:
+        rec.update({k: np.zeros((T + 1, E), dtype=np.float32)
+                    for k in ("f_L", "f_R", "near_L", "near_R", "load_L", "load_R",
+                              "hover_L", "hover_R")})
 
     def snapshot(i, s, ever_done):
         qpos[i] = np.asarray(s.pipeline_state.qpos)
@@ -181,8 +194,19 @@ def main() -> int:
         if d.shape[-1] > 1:
             _k = k_goal
             rec["d_LB1"][i], rec["d_RB1"][i] = d[:, 0, _k], d[:, 1, _k]
+            if uses_contact:
+                near = d[:, :, _k] < 0.05                       # (E, 2) distance gate
+                load = np.asarray(s.info["contact_ema"])        # (E, 2) EMA finger load
+                f = np.asarray(env._hold_feature(s.info["contact_streak"]))
+                rec["near_L"][i], rec["near_R"][i] = near[:, 0], near[:, 1]
+                rec["load_L"][i], rec["load_R"][i] = load[:, 0], load[:, 1]
+                rec["f_L"][i], rec["f_R"][i] = f[:, 0], f[:, 1]
+                loaded = load > env.contact_thresh
+                rec["hover_L"][i], rec["hover_R"][i] = near[:, 0] & ~loaded[:, 0], \
+                    near[:, 1] & ~loaded[:, 1]
         rec["switched"][i] = np.asarray(s.metrics["hand_switches"])
         rec["done"][i] = np.asarray(s.done)
+        rec["live"][i] = ~ever_done          # alive BEFORE this step's `done`
         return ever_done | (np.asarray(s.done) > 0)
 
     ever_done = snapshot(0, state, np.zeros(E, dtype=bool))
@@ -196,11 +220,29 @@ def main() -> int:
     run_max = np.maximum.accumulate(max_bar, axis=0)
     fell_at = [int(np.argmax(rec["done"][:, e] > 0)) if (rec["done"][:, e] > 0).any() else -1
                for e in range(E)]
+    # ---- live-phase mask ---------------------------------------------------
+    # Every mean below must be taken over the steps BEFORE the fall: after `done`
+    # the env keeps stepping (there is no auto-reset in this loop), so an
+    # all-episode mean of a per-step quantity is dominated by hundreds of
+    # free-fall steps and reads ~0 no matter what the policy did.  (This is the
+    # same mistake as counting the free-fall tail as behaviour; see
+    # docs/M2_JaxGCRL接入记录.md 9.61/9.62.)
+    live = rec["live"] > 0
+    n_live = live.sum(axis=0)
+    print(f"[result] live steps      = {n_live.tolist()} of {T + 1} "
+          f"(everything below is measured on these only)")
+
+    def mask(x):
+        return x[live]
+
     print(f"[result] episode max bar = {run_max[-1].astype(int).tolist()}   (0 = never left B0)")
     print(f"[result] fell at step    = {fell_at}   (-1 = survived the episode)")
-    print(f"[result] goal dist       = {rec['dist'][0].mean():.3f} -> {rec['dist'][-1].mean():.3f} "
-          f"({len(env.goal_indices)}-dim)   [position-only 8-dim: {rec['dist_pos'][0].mean():.3f} -> "
-          f"{rec['dist_pos'][-1].mean():.3f}]")
+    print(f"[result] live steps      = {n_live.tolist()} of {T + 1} "
+          f"(everything below is measured on these only)")
+    print(f"[result] goal dist       = {rec['dist'][0].mean():.3f} -> best(live) "
+          f"{rec['dist'].min(axis=0).mean():.3f} ({len(env.goal_indices)}-dim)   "
+          f"[position-only 8-dim: {rec['dist_pos'][0].mean():.3f} -> "
+          f"{rec['dist_pos'].min(axis=0).mean():.3f}]")
     print(f"[result] torso x         = {qpos[0, :, 0].mean():+.3f} -> {qpos[-1, :, 0].mean():+.3f} m "
           f"(bar spacing {env.bar_spacing:.3f} m)")
     print(f"[result] torso z         = {qpos[0, :, 2].mean():.3f} -> {qpos[-1, :, 2].mean():.3f} m")
@@ -210,8 +252,26 @@ def main() -> int:
         who = ["left" if l < r else "right" for l, r in zip(L1, R1)]
         print(f"[result] closest hand to B{k_goal} per episode = {who}  "
               f"(L {np.round(L1,3).tolist()} vs R {np.round(R1,3).tolist()}, threshold 0.05)")
-    print(f"[result] grasping (soft) = L {rec['c_L'].mean():.2f}  R {rec['c_R'].mean():.2f} "
+    print(f"[result] grasping (soft, live) = L {mask(rec['c_L']).mean():.2f}  "
+          f"R {mask(rec['c_R']).mean():.2f} "
+          f"| best-step L {mask(rec['c_L']).max():.2f} R {mask(rec['c_R']).max():.2f} "
           f"(1 = closed on the bar)")
+    if uses_contact:
+        # The decisive readout for the contact family: `f` is the sustained REAL
+        # grip on the INSTRUCTION bar, `hover` is "inside its window but carrying
+        # no load" -- the state the distance criterion (hnext) scores as a grip.
+        def frac(x):
+            return float(np.mean(x > 0.5)) * 100.0
+        print(f"[result] REAL grip on B{k_goal} (f, live): "
+              f"L mean {mask(rec['f_L']).mean():.2f} (f>0.5 in {frac(mask(rec['f_L'])):.0f}% of live steps)  "
+              f"R mean {mask(rec['f_R']).mean():.2f} (f>0.5 in {frac(mask(rec['f_R'])):.0f}%)")
+        print(f"[result] HOVER on B{k_goal} (live; in the 5 cm window, NOT loaded): "
+              f"L {100*mask(rec['hover_L']).mean():.0f}%  R {100*mask(rec['hover_R']).mean():.0f}%  "
+              f"| in-window at all: L {100*mask(rec['near_L']).mean():.0f}%  "
+              f"R {100*mask(rec['near_R']).mean():.0f}%")
+        print(f"[result] finger load EMA (live, N.m): L mean {mask(rec['load_L']).mean():.1f} "
+              f"(max {mask(rec['load_L']).max():.1f})  R mean {mask(rec['load_R']).mean():.1f} "
+              f"(max {mask(rec['load_R']).max():.1f})  [threshold {env.contact_thresh:.1f}]")
 
     name = args.name or os.path.splitext(os.path.basename(args.ckpt))[0]
     outdir = os.path.join(REPO, "runs", "render", name)
@@ -219,16 +279,25 @@ def main() -> int:
     os.makedirs(frames_dir, exist_ok=True)
 
     with open(os.path.join(outdir, "trace.csv"), "w") as fh:
-        fh.write("step,episode,qpos_x,qpos_y,qpos_z,dist,dist_pos,c_L,c_R,bar_L,bar_R,"
-                 "d_LB1,d_RB1,done,hand_switch\n")
+        cols = ("step,episode,qpos_x,qpos_y,qpos_z,dist,dist_pos,c_L,c_R,bar_L,bar_R,"
+                "d_LB1,d_RB1,done,hand_switch")
+        if uses_contact:
+            cols += ",f_L,f_R,near_L,near_R,load_L,load_R,hover_L,hover_R"
+        fh.write(cols + "\n")
         for t in range(T + 1):
             for e in range(E):
-                fh.write(f"{t},{e},{qpos[t,e,0]:.6f},{qpos[t,e,1]:.6f},{qpos[t,e,2]:.6f},"
-                         f"{rec['dist'][t,e]:.6f},{rec['dist_pos'][t,e]:.6f},"
-                         f"{rec['c_L'][t,e]:.6f},{rec['c_R'][t,e]:.6f},"
-                         f"{rec['bar_L'][t,e]:.0f},{rec['bar_R'][t,e]:.0f},"
-                         f"{rec['d_LB1'][t,e]:.6f},{rec['d_RB1'][t,e]:.6f},"
-                         f"{rec['done'][t,e]:.0f},{rec['switched'][t,e]:.0f}\n")
+                row = (f"{t},{e},{qpos[t,e,0]:.6f},{qpos[t,e,1]:.6f},{qpos[t,e,2]:.6f},"
+                       f"{rec['dist'][t,e]:.6f},{rec['dist_pos'][t,e]:.6f},"
+                       f"{rec['c_L'][t,e]:.6f},{rec['c_R'][t,e]:.6f},"
+                       f"{rec['bar_L'][t,e]:.0f},{rec['bar_R'][t,e]:.0f},"
+                       f"{rec['d_LB1'][t,e]:.6f},{rec['d_RB1'][t,e]:.6f},"
+                       f"{rec['done'][t,e]:.0f},{rec['switched'][t,e]:.0f}")
+                if uses_contact:
+                    row += (f",{rec['f_L'][t,e]:.4f},{rec['f_R'][t,e]:.4f},"
+                            f"{rec['near_L'][t,e]:.0f},{rec['near_R'][t,e]:.0f},"
+                            f"{rec['load_L'][t,e]:.2f},{rec['load_R'][t,e]:.2f},"
+                            f"{rec['hover_L'][t,e]:.0f},{rec['hover_R'][t,e]:.0f}")
+                fh.write(row + "\n")
 
     # ------------------------------------------------------------- rendering
     mj_model = mujoco.MjModel.from_xml_path(env.scene_xml)

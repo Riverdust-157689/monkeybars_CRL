@@ -3987,3 +3987,110 @@ f_{h,gk} = 1 - exp(-s_h / 10)                                             # 与 
 **smoke 的 NaN 不是这次改动引入的**：同一 smoke 用既有变体 `support_dual` 也走到同一个
 `[abort] training diverged to NaN`（§9.34.5 已记录的 smoke 配置问题：4 envs / batch 100 / replay 50）。
 判据是**环境指标是否有限**——三个 run 的 `episode_dist`/`cov_*` 全部有限，NaN 只出现在 `critic_loss`。
+
+### 9.73 A 臂结果（`dual_hcontact` 1.5 h / 20 evals）：**阴性，但被一个我自己漏掉的 flag 污染**
+
+`runs/brach_hcontact_b1/`（`git_commit 3b77ee7`，12,197,632 步，`--train-goal-bar 1 --eval-goal-bar 1`，
+thresh 0.8，`buffer_gb 1.0`，`xla 0.6`，`--gpu 0`）。
+
+> ⚠️ **第一个要说的事实**：`args.json` 里 `expl_hold = 1`。我给 A 的命令漏了 `--expl-hold 10`，
+> 而**§9.28.1 之后所有会动的 run 都是 10**（#11/#13/#15/#16/#17/#18/#19/#20/#21/两杆 6h 全是 10，
+> 只有 #7 之前的 #3/#5 没有这个 flag）。这是我的命令错误，下面 §9.73.3 给出修正后的命令。
+
+#### 9.73.1 同预算对照（各 run 自己的 eval 19；#21 是 6 h run 的同预算点 eval 14 ≈ 11.7 M 步）
+
+| run | variant | len | fell | **换手/步** | `max_bar` | `dual_runmax` | `bar_R` | `advance_max` | d/len | succ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **`brach_hcontact_b1`** | **`dual_hcontact`** | **63.6** | **1.00** | **0.151** | **1.8** | **2.8** | **−39.2** | **0.0** | **2.283** | **0** |
+| `brach_hnext_max_b1` | `dual_hnext_max` | 54.1 | 1.00 | 0.154 | 4.9 | 1.2 | −46.5 | 0.0 | 2.431 | 0 |
+| `brach_dual6c_b1` | `dual6c` | 145.5 | 1.00 | 0.107 | 130.3 | 2.9 | −112.4 | 96.1 | 1.741 | 0 |
+| `brach_hnext_dual_b1` | `dual_hnext_dual` | 208.8 | 0.69 | 0.090 | 178.5 | 19.2 | +85.4 | 139.9 | 1.669 | 36.5 |
+| `brach_dual_hnext_6h` @14 | `dual_hnext` | 392.5 | 0.25 | — | 372.7 | 111.3 | +18.4 | — | — | 190.7 |
+| `brach_dual_hnext_6h` @19 | `dual_hnext` | **412.8** | **0.19** | **0.038** | **391.2** | **263.6** | **+212.5** | **334.2** | **0.587** | **295.3** |
+| `brach_dual_b1_6h` @19 | `support_dual` | 450.4 | 0.12 | 0.043 | 425.8 | 314.9 | +330.1 | 395.1 | 0.399 | 311.5 |
+
+（`max_bar`/`bar_R`/`dual_runmax` 都是**逐步求和的运行量**：`max_bar ≈ 1.8` 就是"整个 episode 只有约 2 步
+有手进入 B1 的 5 cm 窗"，而 391 就是"约 390 步"。）
+
+⇒ A 落在 **`dual_hnext_max` 那一档**（fell 100%、从不离开 B0、`advance_max = 0`），
+比同族的 `dual_hnext` 差一个数量级。**这是一个阴性结果。**
+
+#### 9.73.2 渲染（`--goal-bar 1`，4 episodes × 261 步，`runs/render/render_hcontact_b1/`）——失效发生在"到达"之前
+
+新加的 `live` 掩码 + `f/near/load/hover` 列（见 §9.73.4）给出逐 episode 的存活期读数：
+
+| ep | live 步 | fall | 存活期内 min `d_LB1` | 步数 `d_LB1<5cm` | min `d_RB1` | `f_L>0.5` | `f_R>0.5` | `load_L` 均值 | `load_R` 均值 |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 67 | 67 | 0.042 | 2 | 0.173 | **0** | **0** | 4.8 | **56.7** |
+| 1 | 67 | 67 | 0.046 | 1 | 0.166 | **0** | **0** | 6.9 | **57.3** |
+| 2 | 64 | 64 | 0.071 | 0 | 0.166 | **0** | **0** | 6.0 | **58.6** |
+| 3 | 67 | 67 | 0.034 | 2 | 0.174 | **0** | **0** | 7.2 | **58.0** |
+
+**读法**：右手**实打实地抓着 B0**（载荷 57 N·m，全程），左手能伸到离 B1 的**座 3.4–7.1 cm**
+（`dist_pos` 从 0.605 降到 0.251，位置子目标确实在改善），但**只有 0–2 步进过 5 cm 窗**，
+`f_{L,B1} > 0.5` 在**四个 episode 里一次都没有出现**，然后 t≈67 全部坠落。
+
+⇒ **A 的失效不是"到了 B1 却不抓"，而是"根本没到 B1"**——和 §9.28 的 run #6（`expl-hold 1`，"乱抓+掉"）
+是同一个画面的量化版本。它的 `max_bar` 只有 ~2 步、`advance_max = 0`。
+
+**同时这张表说明特征本身在按设计工作**：右手承力 57 N·m 但 `near_R = 0`（它抓的是 B0，不是指令杆）
+⇒ `f_R = 0`，**没有给错杆送分**；左手在 B1 窗口附近但载荷只有 5–7 N·m（< 阈值 12）⇒ `hover_L` 记上、
+`f_L = 0`，**没有把悬停当抓住**。也就是说 §9.72 的验收性质在真实策略轨迹上复现了；
+失败的是**策略没学出来**，不是特征判错。
+
+#### 9.73.3 怎么归因：一个确定的污染 + 一个待检验的机制假设
+
+**(a) 确定的污染：`expl_hold`。** 证据不只是"别的 run 都用 10"：
+
+| run | `expl_hold` | 换手/步 | len | 现象（§9.28） |
+|---|---|---|---|---|
+| run #6 `brach_reach_b1_short` | （flag 尚不存在 = 1）| **0.175** | 60 | "乱抓 + 掉"，抓握被打散 |
+| run #7 `brach_reach_b1_a2p` | 10 | — | 67 | **够杆解决**（C(0.1)=1.00、摆幅 0.067→0.33）|
+| **A `brach_hcontact_b1`** | **1** | **0.151** | **63.6** | 同 #6 档 |
+| 会动的那些（`dual_hnext`/`support_dual`）| 10 | **0.038–0.043** | 413–450 | 保持双持、推进多杆 |
+
+A 的换手率 0.151 与 #6 的 0.175 同档、比会动的 run 高 **3.5–4 倍**。所以**A 的阴性结果不能用来否证接触维**。
+
+**(b) 待检验的机制假设（不是结论）**：即使补上 `expl_hold`，`f` 也许天生比 `hnext` 更难学：
+
+* `hnext` 是**稠密**的——手靠近窗口，`S_h` 就开始涨，1−e^{−S/10} 立即给出中间值，重标记 goal 里有梯度；
+* `f` 被**载荷门**二值化——在"还没有任何持续抓握"之前，`f` 在 achieved 里恒 0，
+  而重标记 goal 取自 buffer 里的未来状态，**那些状态里 `f` 也几乎恒 0** ⇒ 该维在对比任务里
+  近似**恒等/退化**（§9.55 的 `categorical_accuracy 0.011 vs 0.354` 就是这种信号），
+  而指令 goal（`f=1`）在学会之前不可达。它会自我锁死：**要先抓住 25 步才会有 `f`，而不是靠 `f` 学会抓**。
+
+这两条给出一个**可判别的实验**：把 A 原样重跑（只补 `--expl-hold 10`）。
+* 若它到达 B1 并出现 `f>0.5` 的持续段 ⇒ (a) 是主因，接触维可用；
+* 若它仍 `advance_max=0` ⇒ (b) 得到支持，下一步应给 `f` 加一个**稠密前驱**（例如
+  `min(c_{h,gk}, load 的连续量)` 或把 `f` 的 streak 门放宽成"载荷的连续值"），而不是直接否决接触量。
+
+#### 9.73.4 顺带修掉的两个 render 侧问题（都已改进，见 `src/render_policy.py`）
+
+1. **"整段平均"把坠落尾巴算成行为**——又一次。渲染循环不做 auto-reset，坠落之后还有几百步自由落体，
+   于是 `grasping (soft)` 这种全段均值被拖到 ~0（A 的第一版输出就是 `L 0.01 R 0.03`，
+   而存活期内是 `L 0.06 R 0.24`、最好一步 `L 1.00 R 1.00`）。现在所有读数都**只在 `live` 掩码上取**
+   （`live` 逐步记录"本步开始时还活着"），并打印 `live steps`。
+   > 这个坑我踩过两次（§9.61/§9.62 的"鱼跃"统计），所以这次直接在代码里写死，不靠自觉。
+2. **`strict live` 掩码本身第一版写错了**：`live = ~ever_done` 里的 `ever_done` 只是**当前累加器**
+   （形状 `(E,)`），不是逐步历史 ⇒ 掩码退化成"最终全部坠落"⇒ `live steps = 0 of 261`，
+   并在下一行布尔索引时抛异常。改成在 `snapshot` 里逐步记录（`rec["live"][i] = ~ever_done`，即**本步
+   `done` 之前**的状态）。
+3. 新列：`f_L,f_R,near_L,near_R,load_L,load_R,hover_L,hover_R`（只在接触族变体的 trace.csv 里出现），
+   以及对应的 summary 行（REAL grip / HOVER / finger load EMA）。
+
+#### 9.73.5 修正后的 A 臂命令（1.5 h，单变量：只补 `expl_hold`）
+
+```bash
+cd ~/monkeyBars_CRL && unset JAX_PLATFORMS CUDA_VISIBLE_DEVICES
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce \
+  --goal-variant dual_hcontact --goal-reach-thresh 0.8 \
+  --train-goal-bar 1 --eval-goal-bar 1 --scene full035 \
+  --num-envs 128 --num-eval-envs 16 --episode-length 501 --batch-size 512 \
+  --steps 12200000 --num-evals 20 --expl-hold 10 \
+  --buffer-gb 1.0 --xla-mem-fraction 0.6 --gpu 0 --save-every 5 \
+  --exp-name brach_hcontact_b1_eh10 --checkpoint-dir runs/ckpt_hcontact_b1_eh10 \
+  --wandb --wandb-group .
+```
+
+判读只看三件事：`advance_max`/`max_bar` 是否离开 0、`cov_contact_*_on_steps` 是否出现持续段、
+渲染里 `f_{L,B1}>0.5` 的步数是否非零。**在它跑出来之前，不要对接触维下结论。**
