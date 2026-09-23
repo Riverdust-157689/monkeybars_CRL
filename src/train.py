@@ -261,6 +261,15 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--wandb-group", default=".")
     ap.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     ap.add_argument("--checkpoint-dir", default=None, help="where to save final params")
+    ap.add_argument("--init-from", default=None,
+                    help="9.76 WARM START: initialise the actor/critic/alpha parameters "
+                         "from a checkpoint (runs/ckpt_*/final = the (alpha, actor, "
+                         "critic) tuple, or an actor_*.pkl = actor only).  This is NOT "
+                         "a resume: the replay buffer, the Adam moments, the RNG and the "
+                         "step counters all restart, so the run continues from the same "
+                         "policy and critic values but with a cold optimiser and an empty "
+                         "buffer.  The observation layout must match EXACTLY (same "
+                         "--goal-variant and goal size), otherwise the run aborts here.")
     ap.add_argument("--save-every", type=int, default=10,
                     help="with --checkpoint-dir: save an actor-only checkpoint every N "
                          "EVALS (0 = only at the end).  A run whose params are not "
@@ -479,6 +488,38 @@ def main() -> int:
     # record the *effective* values (args.json was written before the guard)
     with open(os.path.join(run_dir, "args.json"), "w") as fh:
         json.dump(vars(args), fh, indent=2)
+    # ---- 9.76 warm start --------------------------------------------------
+    init_alpha = init_actor = init_critic = None
+    if args.init_from:
+        import pickle as _pickle
+        with open(args.init_from, "rb") as _fh:
+            _blob = _pickle.load(_fh)
+        if isinstance(_blob, dict) and "actor" in _blob:      # actor_*.pkl
+            init_actor = _blob["actor"]
+            print("[init] actor-only checkpoint: critic and alpha start fresh")
+        elif isinstance(_blob, (tuple, list)) and len(_blob) == 3:   # runs/ckpt/*/final
+            init_alpha, init_actor, init_critic = _blob
+        else:
+            raise SystemExit(f"--init-from {args.init_from}: unrecognised checkpoint "
+                             f"({type(_blob).__name__}); expected the (alpha, actor, "
+                             f"critic) tuple or an actor_*.pkl dict")
+        import jax as _jx                      # train.py names it _jax elsewhere
+        obs_now = train_env.observation_size
+        _kernels = [l for l in _jx.tree_util.tree_leaves(init_actor)
+                    if getattr(l, "ndim", 0) == 2]
+        _widths = sorted({int(l.shape[0]) for l in _kernels}
+                         | {int(l.shape[1]) for l in _kernels})
+        if obs_now not in _widths:
+            raise SystemExit(
+                f"FATAL --init-from: this env observes {obs_now} dims but the "
+                f"checkpoint's actor only has layer widths {_widths}.  A warm start "
+                f"requires the SAME --goal-variant (and goal size); e.g. "
+                f"support_dual_contact (159) and support_dual_load_both (161) are "
+                f"NOT interchangeable.")
+        print(f"[init] WARM START from {args.init_from}: actor input {obs_now}-D OK, "
+              f"critic {'+ alpha ' if init_critic is not None else ''}loaded.  "
+              f"NOTE: replay buffer / Adam moments / step counter restart at 0 -- "
+              f"this continues the policy, not the optimisation.")
     agent = CRL(
         policy_lr=3e-4, critic_lr=3e-4, alpha_lr=3e-4,
         batch_size=args.batch_size,
@@ -495,6 +536,9 @@ def main() -> int:
         energy_fn=cfg["energy_fn"],
         entropy_param=args.entropy_param,
         expl_hold=args.expl_hold,
+        init_alpha_params=init_alpha,
+        init_actor_params=init_actor,
+        init_critic_params=init_critic,
     )
     run = RunConfig(
         env="brachiation", total_env_steps=args.steps,
@@ -550,6 +594,7 @@ def main() -> int:
                            contact_f0=float(train_env.contact_f0),
                            contact_theta=float(train_env.contact_theta),
                            contact_ema=float(train_env.contact_ema),
+                           init_from=str(args.init_from or ""),
                            start_bar_max=int(args.start_bar_max),
                            train_goal_bar_min=int(args.train_goal_bar_min),
                            train_goal_bar_max=int(train_env.goal_bar_max),

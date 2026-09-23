@@ -145,6 +145,17 @@ class CRL:
 
     disable_entropy_actor: bool = False
 
+    # ---- 9.76 warm start (src/train.py --init-from) ------------------------
+    # Parameter trees to initialise from instead of a fresh ``.init(...)``.  This
+    # is NOT a resume: the replay buffer, the Adam moments, the RNG and the step
+    # counters are all created fresh, so training continues from the same POLICY
+    # and CRITIC values but with a cold optimiser and an empty buffer.  A true
+    # resume would additionally need the replay buffer (~1 GiB here), the optax
+    # states, the RNG keys and the env state -- none of which are checkpointed.
+    init_alpha_params: Any = None
+    init_actor_params: Any = None
+    init_critic_params: Any = None
+
     # target entropy = -entropy_param * action_size (upstream hardcodes 0.5).  With
     # q_des = key + scale * a, a bigger action window means the same action-space
     # noise produces proportionally bigger JOINT-space noise, so this is the knob to
@@ -267,7 +278,8 @@ class CRL:
         )
         actor_state = TrainState.create(
             apply_fn=actor.apply,
-            params=actor.init(actor_key, np.ones([1, obs_size])),
+            params=(self.init_actor_params if self.init_actor_params is not None
+                    else actor.init(actor_key, np.ones([1, obs_size]))),
             tx=optax.adam(learning_rate=self.policy_lr),
         )
 
@@ -296,6 +308,8 @@ class CRL:
             # cosine similarity into a useful InfoNCE logit range. Initialized
             # to CLIP's initial value (1 / 0.07 =~ 14.3).
             critic_params["log_logit_scale"] = jnp.log(jnp.asarray(1 / 0.07, dtype=jnp.float32))
+        if self.init_critic_params is not None:
+            critic_params = self.init_critic_params
         critic_state = TrainState.create(
             apply_fn=None,
             params=critic_params,
@@ -304,7 +318,9 @@ class CRL:
 
         # Entropy coefficient
         target_entropy = -self.entropy_param * action_size
-        log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
+        log_alpha = (jnp.asarray(self.init_alpha_params["log_alpha"])
+                     if self.init_alpha_params is not None
+                     else jnp.asarray(0.0, dtype=jnp.float32))
         alpha_state = TrainState.create(
             apply_fn=None,
             params={"log_alpha": log_alpha},
