@@ -4280,3 +4280,78 @@ g_h = (d[h, argmin_k d[h,k]] < 0.05)  AND  (EMA_5(F_h) > F0*theta)     # 杆无�
 
 判读（与 `dual2bar_6h` 对照）：`--goal-bar 2` 渲染里 (a) **先碰 B2 前是否仍有 17–19 步在 B1 上**
 （bar-agnostic 是否保住了踏脚石）、(b) **B2 的 `f>0.5` 步占比是否从 0–15% 上去**、(c) 存活是否超过 57–61 步。
+
+### 9.76 「能不能复用 6h 的权重接着跑？」——权重可以 warm start，**"接着跑"做不到**
+
+#### 9.76.1 仓库到底存了什么（读代码 + 读文件确认，不是猜）
+
+`runs/ckpt_contact_2bar_6h/` 只有两种产物：
+
+| 文件 | 内容 | 大小 |
+|---|---|---|
+| `actor_*.pkl` / `actor_latest.pkl` | **只有 actor** 参数 + config + steps（`train.py::save_actor`）| 4.4 MB |
+| `final` | **pickle 的 3 元组 `(alpha, actor, critic)`**：`{'log_alpha': -3.73}` / `{'params':…1100828}` / `{'g_encoder','sa_encoder':…2200448}` | 13 MB |
+
+**一次真正的 resume 还需要**（全都没存，事后也无法恢复）：
+
+* replay buffer：这里 `max_replay_size=12122 × 128 envs` ≈ **1 GiB** 的转移；
+* actor / critic / alpha 各自的 **Adam 动量**（optax state）；
+* RNG key、`env_steps`/`gradient_steps` 计数、以及 wrapped env 的 `pipeline_state`（轨迹 id、episode 计数）。
+
+`CRL.train_fn` 里这些状态都是**现场 `TrainState.create(...)` 建的**（动量全 0、`env_steps=0`），
+所以即使把参数塞进去，**优化过程也是从零开始**。⇒ **"接着跑"只能在下次跑之前先加全状态存档**（见 9.76.4）。
+
+#### 9.76.2 已实现：`--init-from`（warm start，不是 resume）
+
+* `crl.py` 加三个可选字段 `init_{alpha,actor,critic}_params`，`train_fn` 里用它**替代** `actor.init(...)` / 新建的
+  `critic_params` / `log_alpha=0`；
+* `train.py --init-from <path>`：接受 `runs/ckpt/*/final`（三元组）或 `actor_*.pkl`（只有 actor，则 critic/alpha 冷启）；
+* **观测布局硬校验**：取 checkpoint 里 actor 的所有 2-D 层宽度，若本环境 `observation_size` 不在其中就
+  **立即失败**并说明（`support_dual_contact` 159 dims ≠ `support_dual_load_both` 161 dims，**不能互换**）；
+* `args.json` 与 checkpoint 的 config 里都记 `init_from`，可追溯。
+
+实测校验（本次 6h ckpt）：actor 2-D 宽度 = **[14, 159, 256]**，159 == 本环境 obs ✓；`log_alpha = -3.73`
+⇒ **alpha = 0.024**（从初始 1.0 一路自适应降下来的）。warm start 会把这个值一起带过去——
+这点很关键：冷启 alpha=1.0 会让前期探索噪声大得多。
+
+**它不是 resume 的地方**（必须记在结论里）：buffer 空、Adam 动量 0、步数从 0 计、RNG 新。
+所以前 ~1 M 步会出现"critic 重新适应 + buffer 重新填充"的凹陷，**不要拿它和 6h run 的曲线逐点相接**，
+只和它最后几个 eval 的数字比。
+
+#### 9.76.3 1 h 续跑命令（先 30 秒 smoke 验加载，再正式跑）
+
+```bash
+cd ~/monkeyBars_CRL && unset JAX_PLATFORMS CUDA_VISIBLE_DEVICES
+
+# ① 30 秒 smoke：只验 "能不能加载 + 能不能 jit"
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce --smoke \
+  --goal-variant support_dual_contact --goal-reach-thresh 0.35 --train-goal-bar 1 --eval-goal-bar 1 \
+  --scene full035 --expl-hold 10 \
+  --init-from runs/ckpt_contact_2bar_6h/final --exp-name smoke_warm
+#   看到 "[init] WARM START from …: actor input 159-D OK" 就说明加载成功
+
+# ② 正式 1 h（≈9.1 M 步；按实测 2527 steps/s × 3600 s）
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce \
+  --goal-variant support_dual_contact --goal-reach-thresh 0.35 \
+  --train-goal-bar -1 --train-goal-bar-min 1 --train-goal-bar-max 2 --start-bar-max 1 \
+  --eval-goal-bar 1 --scene full035 \
+  --num-envs 128 --num-eval-envs 16 --episode-length 501 --batch-size 512 \
+  --steps 9000000 --num-evals 11 --expl-hold 10 --save-every 2 \
+  --buffer-gb 1.0 --xla-mem-fraction 0.6 --gpu 0 \
+  --init-from runs/ckpt_contact_2bar_6h/final \
+  --exp-name brach_contact_2bar_warm1h --checkpoint-dir runs/ckpt_contact_2bar_warm1h \
+  --wandb --wandb-group .
+```
+
+判读：拿 6h run 的 **eval 59**（`len 472.2 / fell 0.06 / advance_max 357.8 / bar_L 337.8 / succ 98.2`）
+作基准，看 11 个 eval 之后能否超过；另外 `--goal-bar 2` 渲染里看
+(a) 先碰 B2 前在 B1 的步数、(b) B2 上 `f>0.5` 的占比、(c) 存活是否超过 116–130 步。
+**值不值得跑**：6h run 最后两个 eval 还在陡升（`len 243→472`、`succ 7.6→98.2`），所以 1 h 大概率能看到变化；
+但它是 warm start 不是续跑，出现短暫回落是正常的。
+
+#### 9.76.4 若以后要**真正**的"接着跑"：需要先加全状态存档
+
+要加的东西（约 30 行 + 一条守卫）：在 `--checkpoint-dir` 里周期性 pickle
+`(training_state, replay_buffer_state, env_state, rng, config)`，再加 `--resume-state`；
+一份 ~1 GiB，落盘 10–30 s。**只在加了这个之后的 run 上才谈得上"接着跑"**；
+本次 6h run 没有，所以无法补。
