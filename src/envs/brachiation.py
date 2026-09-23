@@ -152,7 +152,7 @@ class FeatureLayout(NamedTuple):
                            # (qfrc_constraint), not from distance (see CONTACT_F0)
     lcontact: slice        # 9.74: BAR-AGNOSTIC load-gated trio
                            # [h_any_load, h_dual_load, h_both_load] -- see
-                           # LCONTACT_FAMILY.  No k_goal dependence at all.
+                           # LOAD_FAMILY.  No k_goal dependence at all.
     park: slice            # how long the torso has been parked under some bar
     cross: slice           # [p_R - p_B1 (3), c_{R,B1}, c_{L,B0}]  (only variant "cross")
     prev_action: slice
@@ -165,7 +165,7 @@ class FeatureLayout(NamedTuple):
 GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
                  "dual_cnext", "dual_hnext", "dual_hnext_max", "dual_hnext_dual",
                  "dual_hcontact", "support_dual_contact",
-                 "support_dual_lc", "support_dual_lcb",
+                 "support_dual_load", "support_dual_load_both",
                  "dual6c", "dual6d", "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
@@ -213,7 +213,7 @@ SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
                   # 以及 dual_hnext 的 hnext(2) -> contact(2) 单变量替换版
                   "support_dual_contact", "dual_hcontact",
                   # 9.74: bar-agnostic load trio = support_dual + 2-3 dims
-                  "support_dual_lc", "support_dual_lcb")
+                  "support_dual_load", "support_dual_load_both")
 # "dual6c"/"dual6d" are deliberately NOT in SUPPORT_FAMILY: their goal drops the
 # max(c)/h_any/h_dual block entirely (x,z + goal-bar per-hand terms only).
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
@@ -226,7 +226,7 @@ HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
                # 9.72: dual_hcontact carries h_any/h_dual as OBSERVABLES only, so
                # that its state is dual_hnext's state with hnext(2) -> contact(2)
                # (a clean single-variable probe, not a state-size change too)
-               "dual_hcontact", "support_dual_lc", "support_dual_lcb")
+               "dual_hcontact", "support_dual_load", "support_dual_load_both")
 # "dual_nomax" = run #13's support_dual minus the instantaneous `max(c_L,c_R)`
 # entry (goal = [x, z, p_L(3), p_R(3), h_any, h_dual], 10-D).  The rationale above
 # was FALSIFIED by run #18 + CPU measurement (docs/M2_JaxGCRL接入记录.md 9.50):
@@ -235,7 +235,7 @@ HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
 # training collapse (fell 100%, advance/succ stuck at 0).  Kept for the record.
 DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext",
                "dual_hnext_dual", "support_dual_contact", "dual_hcontact",
-               "support_dual_lc", "support_dual_lcb")
+               "support_dual_load", "support_dual_load_both")
 # "dual_cnext" (9.51) keeps a high-gain instantaneous contact term -- the measured
 # load-bearing part -- but makes it PER-HAND and aimed at the INSTRUCTION GOAL BAR:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_any, h_dual]      (12-D)
@@ -331,7 +331,7 @@ CONTACT_FAMILY = ("dual_hcontact", "support_dual_contact")
 # one term that targets the REACHING hand during a hand-over -- `h_any_load` is
 # already satisfied by the supporting hand, and `h_dual_load` says nothing about
 # which hand, so neither can demand that the hand that just arrived takes load.
-LCONTACT_FAMILY = ("support_dual_lc", "support_dual_lcb")
+LOAD_FAMILY = ("support_dual_load", "support_dual_load_both")
 # `hold = 1 - exp(-streak / HOLD_TAU)` where `streak` is the number of consecutive
 # steps with at least one hand inside the grasp window of some bar (< GRASP_THRESH,
 # the same criterion as bar_L/bar_R/max_bar -- NOT max(c) > 0.5, which would call a
@@ -418,7 +418,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     # variant.
     contact = nxt(2) if goal_variant in CONTACT_FAMILY else slice(i, i)
     # 9.74 bar-agnostic load trio (no k_goal dependence)
-    lcontact = nxt(3) if goal_variant in LCONTACT_FAMILY else slice(i, i)
+    lcontact = nxt(3) if goal_variant in LOAD_FAMILY else slice(i, i)
     # "park": how long the TORSO has been inside some bar's hang box (history)
     park = nxt(1) if goal_variant == "park" else slice(i, i)
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
@@ -436,11 +436,11 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         # load instead of distance (single-variable swap, see CONTACT_FAMILY).
         goal_indices = goal_indices + (cnext.start, cnext.start + 1,
                                        contact.start, contact.start + 1)
-    elif goal_variant in LCONTACT_FAMILY:
+    elif goal_variant in LOAD_FAMILY:
         # [x, z, p(6), max(c), h_any, h_dual] + [h_any_load, h_dual_load(, h_both_load)]
         base = (grasp_support.start, hold.start, hold_dual.start,
                 lcontact.start, lcontact.start + 1)
-        goal_indices = goal_indices + (base if goal_variant == "support_dual_lc"
+        goal_indices = goal_indices + (base if goal_variant == "support_dual_load"
                                        else base + (lcontact.start + 2,))
     elif goal_variant == "support_dual_contact":
         # [x, z, p(6), max(c), h_any, h_dual, f_L,gk, f_R,gk]  (13)
@@ -594,8 +594,8 @@ class Brachiation(Env):
              "dual_hcontact": _pos + [28, 29, 34, 35],
              "support_dual_contact": _pos + [10, 19, 20, 34, 35],
              # 9.74 bar-agnostic load trio (superset 36, 37, 38)
-             "support_dual_lc": _pos + [10, 19, 20, 36, 37],
-             "support_dual_lcb": _pos + [10, 19, 20, 36, 37, 38],
+             "support_dual_load": _pos + [10, 19, 20, 36, 37],
+             "support_dual_load_both": _pos + [10, 19, 20, 36, 37, 38],
              "dual6c": [0, 1, 28, 29, 30, 31],
              "dual6d": [0, 1, 32, 33, 30, 31],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
@@ -1030,7 +1030,7 @@ class Brachiation(Env):
             # through _hold_feature in `step`), exactly like `hnext`: it is a
             # function of the REAL finger load, not of the instantaneous state.
             parts.append(jnp.broadcast_to(jnp.asarray(contact, jnp.float32), (2,)))
-        if self.goal_variant in LCONTACT_FAMILY:
+        if self.goal_variant in LOAD_FAMILY:
             # 9.74: bar-agnostic load trio, also history (info["lcontact_streak"])
             parts.append(jnp.broadcast_to(jnp.asarray(lcontact, jnp.float32), (3,)))
         if self.goal_variant == "park":

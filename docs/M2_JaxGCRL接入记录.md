@@ -4230,7 +4230,7 @@ thresh 0.35，**`--expl-hold 10`** ✓，`buffer_gb 1.0`，`xla 0.6`）。
 **13–26 N·m 的轻蹭**（真实悬垂是 40–70）。`c` 全程 0.47–0.82（"看起来在接触"）。
 **这就是"距离判据"漏掉的东西，也正是接触量要补的**。
 
-#### 9.75.3 实现：bar-agnostic + load-gated 的新家族（`support_dual_lc` / `support_dual_lcb`）
+#### 9.75.3 实现：bar-agnostic + load-gated 的新家族（`support_dual_load` / `support_dual_load_both`）
 
 两个修法是**正交的、都要**：bar-agnostic 保住"B1 这块踏脚石也算数"（不跳步、且不依赖被采样的指令杆），
 load-gated 补上"在窗内 ≠ 抓住"。用每只手的布尔量
@@ -4241,8 +4241,8 @@ g_h = (d[h, argmin_k d[h,k]] < 0.05)  AND  (EMA_5(F_h) > F0*theta)     # 杆无�
 
 | 变体 | goal | 维数 |
 |---|---|---|
-| **`support_dual_lc`** | `support_dual` + `[h_any_load, h_dual_load]` | 13（state 147 / obs 160）|
-| **`support_dual_lcb`** | 上面 + `[h_both_load]` | 14（state 147 / obs 161）|
+| **`support_dual_load`** | `support_dual` + `[h_any_load, h_dual_load]` | 13（state 147 / obs 160）|
+| **`support_dual_load_both`** | 上面 + `[h_both_load]` | 14（state 147 / obs 161）|
 
 * `h_any_load` / `h_dual_load` 是 `h_any` / `h_dual` 的**载荷版**（同杆双手 = `both g_h` 且在同一根杆窗内）；
 * `h_both_load` = **两手都承力（可以不在同一根杆上）**。这是唯一能对**正在换手的那只手**提要求的项：
@@ -4268,7 +4268,7 @@ g_h = (d[h, argmin_k d[h,k]] < 0.05)  AND  (EMA_5(F_h) > F0*theta)     # 杆无�
 
 ```bash
 .venv-warp/bin/python -u src/train.py --preset C_l2_infonce \
-  --goal-variant support_dual_lcb --goal-reach-thresh 0.35 \
+  --goal-variant support_dual_load_both --goal-reach-thresh 0.35 \
   --train-goal-bar -1 --train-goal-bar-min 1 --train-goal-bar-max 2 --start-bar-max 1 \
   --eval-goal-bar 1 --scene full035 \
   --num-envs 128 --num-eval-envs 16 --episode-length 501 --batch-size 512 \

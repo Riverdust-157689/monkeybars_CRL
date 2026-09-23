@@ -256,7 +256,7 @@ def main() -> int:
                    H_R_min >= 2.0 * thr))
     checks.append(("N: the robot actually fell (final torso z well below the bars)",
                    float(N["z"][-1]) < float(env0.bar_z) - 0.4))
-    # ---- 9.74 bar-agnostic load trio (support_dual_lc / _lcb only) ----------
+    # ---- 9.74 bar-agnostic load trio (support_dual_load / _lcb only) ----------
     if P["obs_lcontact"] is not None:
         print(f"[contact] bar-agnostic trio [any_load, dual_load, both_load] at the "
               f"last step: P={np.round(P['obs_lcontact'],3)} "
