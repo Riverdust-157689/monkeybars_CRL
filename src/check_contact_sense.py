@@ -143,6 +143,11 @@ def main() -> int:
         # the two dims the actor actually consumes: obs = [state | goal], and the
         # contact slots live in the state block for this family
         rec["obs_contact"] = np.asarray(state.obs[env.layout.contact])
+        # 9.74: the bar-agnostic load trio, when the variant carries it
+        lc = env.layout.lcontact
+        rec["obs_lcontact"] = (np.asarray(state.obs[lc]) if lc.stop > lc.start
+                               else None)
+        rec["lstreak"] = np.asarray(state.info["lcontact_streak"])
         rec["env"] = env
         rec["skip"] = skip
         return rec
@@ -183,9 +188,14 @@ def main() -> int:
             v = r[f"cov_load_{h}"]
             print(f"  {tag:3s} {h}: min {v.min():6.1f}  p50 "
                   f"{np.percentile(v, 50):6.1f}  max {v.max():6.1f}")
-    print(f"[contact] obs[contact] (what the actor sees) at the last step: "
-          f"P={np.round(P['obs_contact'],3)}  H={np.round(H['obs_contact'],3)}  "
-          f"N={np.round(N['obs_contact'],3)}  P2={np.round(P2['obs_contact'],3)}")
+    # `contact` is the bar-SPECIFIC pair (CONTACT_FAMILY only); the 9.74 variants
+    # carry the bar-agnostic trio instead, so every check below is gated on which
+    # slots the variant actually has.
+    has_contact = P["obs_contact"].size == 2
+    if has_contact:
+        print(f"[contact] obs[contact] (what the actor sees) at the last step: "
+              f"P={np.round(P['obs_contact'],3)}  H={np.round(H['obs_contact'],3)}  "
+              f"N={np.round(N['obs_contact'],3)}  P2={np.round(P2['obs_contact'],3)}")
     hnext_peak = streak_feature_peak(H["cov_near_L_on_steps"])
     force_peak = streak_feature_peak(H["cov_contact_L_on_steps"])
     print("[contact] the HOVER gap, arm H (left hand parked at B0, not gripping; "
@@ -246,6 +256,35 @@ def main() -> int:
                    H_R_min >= 2.0 * thr))
     checks.append(("N: the robot actually fell (final torso z well below the bars)",
                    float(N["z"][-1]) < float(env0.bar_z) - 0.4))
+    # ---- 9.74 bar-agnostic load trio (support_dual_lc / _lcb only) ----------
+    if P["obs_lcontact"] is not None:
+        print(f"[contact] bar-agnostic trio [any_load, dual_load, both_load] at the "
+              f"last step: P={np.round(P['obs_lcontact'],3)} "
+              f"H={np.round(H['obs_lcontact'],3)} N={np.round(N['obs_lcontact'],3)} "
+              f"P2={np.round(P2['obs_lcontact'],3)}  streaks "
+              f"P={P['lstreak']} H={H['lstreak']}")
+        checks.append(("trio/P: both hands really gripping the SAME bar -> [~1,~1,~1]",
+                       bool(P["obs_lcontact"][0] > 0.9 and P["obs_lcontact"][1] > 0.9
+                            and P["obs_lcontact"][2] > 0.9)))
+        checks.append(("trio/P2: a loaded hand on the WRONG bar still counts as "
+                       "'any hand loaded' (this is the bar-agnostic property, and it "
+                       "is what keeps the B1 stepping stone paying) -> [1,1,1]",
+                       bool(P2["obs_lcontact"][0] > 0.9 and P2["obs_lcontact"][1] > 0.9
+                            and P2["obs_lcontact"][2] > 0.9)))
+        # consistency, not level: 1-exp(-s/10) only passes 0.9 at s=23, so a level
+        # assertion is silently an assertion about --steps (same trap as the
+        # bar-specific obs checks above).
+        H_lf = 1.0 - np.exp(-H["lstreak"] / 10.0)
+        checks.append((f"trio/H: one hand loaded, the other OPEN -> any = "
+                       f"1-exp(-streak/10) (streak {H['lstreak'][0]}) but dual == "
+                       f"both == 0 -- this is what makes it demand the REACHING hand "
+                       f"(obs {np.round(H['obs_lcontact'],3)})",
+                       bool(H["lstreak"][0] >= args.steps
+                            and abs(H["obs_lcontact"][0] - H_lf[0]) < 1e-5
+                            and H["obs_lcontact"][1] == 0.0
+                            and H["obs_lcontact"][2] == 0.0)))
+        checks.append(("trio/N: released -> all three 0",
+                       bool(np.max(N["obs_lcontact"]) <= args.open)))
     # The obs check is a *consistency* check, not a level check: the recorded
     # feature must be exactly 1-exp(-streak/10) of the recorded streak, and the
     # streak must have survived the whole recorded window.  (A level check such as
@@ -255,28 +294,29 @@ def main() -> int:
 
     P_feat = feat(P["final_streak"])
     H_feat = feat(H["final_streak"])
-    checks.append((f"obs plumbing: P's contact slots (state dims "
-                   f"{env0.layout.contact}) == 1-exp(-streak/10) with a full streak "
-                   f"(streak {P['final_streak']}, obs "
-                   f"{np.round(P['obs_contact'], 3)} vs {np.round(P_feat, 3)})",
-                   bool(np.all(P["final_streak"] >= args.steps)
-                        and np.allclose(P["obs_contact"], P_feat, atol=1e-5))))
-    checks.append((f"obs plumbing: H's hovering left slot is 0 (streak "
-                   f"{H['final_streak'][0]}) while its supporting right slot is "
-                   f"1-exp(-streak/10) (streak {H['final_streak'][1]}, obs "
-                   f"{np.round(H['obs_contact'], 3)} vs {np.round(H_feat, 3)})",
-                   bool(H["final_streak"][0] == 0.0
-                        and H["final_streak"][1] >= 3.0
-                        and H["obs_contact"][0] == 0.0
-                        and abs(H["obs_contact"][1] - H_feat[1]) < 1e-5)))
-    checks.append((f"obs plumbing: N/P2 contact slots and streaks are all 0 "
-                   f"(obs {np.round(N['obs_contact'],3)} / "
-                   f"{np.round(P2['obs_contact'],3)}, streaks "
-                   f"{N['final_streak']} / {P2['final_streak']})",
-                   bool(np.max(N["obs_contact"]) == 0.0
-                        and np.max(P2["obs_contact"]) == 0.0
-                        and np.max(N["final_streak"]) == 0.0
-                        and np.max(P2["final_streak"]) == 0.0)))
+    if has_contact:
+      checks.append((f"obs plumbing: P's contact slots (state dims "
+                     f"{env0.layout.contact}) == 1-exp(-streak/10) with a full streak "
+                     f"(streak {P['final_streak']}, obs "
+                     f"{np.round(P['obs_contact'], 3)} vs {np.round(P_feat, 3)})",
+                     bool(np.all(P["final_streak"] >= args.steps)
+                          and np.allclose(P["obs_contact"], P_feat, atol=1e-5))))
+      checks.append((f"obs plumbing: H's hovering left slot is 0 (streak "
+                     f"{H['final_streak'][0]}) while its supporting right slot is "
+                     f"1-exp(-streak/10) (streak {H['final_streak'][1]}, obs "
+                     f"{np.round(H['obs_contact'], 3)} vs {np.round(H_feat, 3)})",
+                     bool(H["final_streak"][0] == 0.0
+                          and H["final_streak"][1] >= 3.0
+                          and H["obs_contact"][0] == 0.0
+                          and abs(H["obs_contact"][1] - H_feat[1]) < 1e-5)))
+      checks.append((f"obs plumbing: N/P2 contact slots and streaks are all 0 "
+                     f"(obs {np.round(N['obs_contact'],3)} / "
+                     f"{np.round(P2['obs_contact'],3)}, streaks "
+                     f"{N['final_streak']} / {P2['final_streak']})",
+                     bool(np.max(N["obs_contact"]) == 0.0
+                          and np.max(P2["obs_contact"]) == 0.0
+                          and np.max(N["final_streak"]) == 0.0
+                          and np.max(P2["final_streak"]) == 0.0)))
 
     print("[contact] controls:")
     bad = 0

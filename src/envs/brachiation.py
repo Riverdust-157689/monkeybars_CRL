@@ -150,6 +150,9 @@ class FeatureLayout(NamedTuple):
     contact: slice         # [f_L,gk, f_R,gk]: per-hand SUSTAINED contact with the
                            # goal bar measured from the REAL contact load
                            # (qfrc_constraint), not from distance (see CONTACT_F0)
+    lcontact: slice        # 9.74: BAR-AGNOSTIC load-gated trio
+                           # [h_any_load, h_dual_load, h_both_load] -- see
+                           # LCONTACT_FAMILY.  No k_goal dependence at all.
     park: slice            # how long the torso has been parked under some bar
     cross: slice           # [p_R - p_B1 (3), c_{R,B1}, c_{L,B0}]  (only variant "cross")
     prev_action: slice
@@ -162,6 +165,7 @@ class FeatureLayout(NamedTuple):
 GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
                  "dual_cnext", "dual_hnext", "dual_hnext_max", "dual_hnext_dual",
                  "dual_hcontact", "support_dual_contact",
+                 "support_dual_lc", "support_dual_lcb",
                  "dual6c", "dual6d", "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
@@ -207,7 +211,9 @@ SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
                   "dual_hnext_max", "dual_hnext_dual",
                   # 9.72: support_dual + 两个"真实接触"维（max(c) 仍作为角色 2）,
                   # 以及 dual_hnext 的 hnext(2) -> contact(2) 单变量替换版
-                  "support_dual_contact", "dual_hcontact")
+                  "support_dual_contact", "dual_hcontact",
+                  # 9.74: bar-agnostic load trio = support_dual + 2-3 dims
+                  "support_dual_lc", "support_dual_lcb")
 # "dual6c"/"dual6d" are deliberately NOT in SUPPORT_FAMILY: their goal drops the
 # max(c)/h_any/h_dual block entirely (x,z + goal-bar per-hand terms only).
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
@@ -220,7 +226,7 @@ HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
                # 9.72: dual_hcontact carries h_any/h_dual as OBSERVABLES only, so
                # that its state is dual_hnext's state with hnext(2) -> contact(2)
                # (a clean single-variable probe, not a state-size change too)
-               "dual_hcontact")
+               "dual_hcontact", "support_dual_lc", "support_dual_lcb")
 # "dual_nomax" = run #13's support_dual minus the instantaneous `max(c_L,c_R)`
 # entry (goal = [x, z, p_L(3), p_R(3), h_any, h_dual], 10-D).  The rationale above
 # was FALSIFIED by run #18 + CPU measurement (docs/M2_JaxGCRL接入记录.md 9.50):
@@ -228,7 +234,8 @@ HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
 # goal of 1.0, the trained policy drives it to 0.96-0.98, and deleting it makes
 # training collapse (fell 100%, advance/succ stuck at 0).  Kept for the record.
 DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext",
-               "dual_hnext_dual", "support_dual_contact", "dual_hcontact")
+               "dual_hnext_dual", "support_dual_contact", "dual_hcontact",
+               "support_dual_lc", "support_dual_lcb")
 # "dual_cnext" (9.51) keeps a high-gain instantaneous contact term -- the measured
 # load-bearing part -- but makes it PER-HAND and aimed at the INSTRUCTION GOAL BAR:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_any, h_dual]      (12-D)
@@ -291,6 +298,40 @@ DNEXT_FAMILY = ("dual6d",)
 # exactly the bar-agnostic "any hand / both hands loaded on the goal bar", so the
 # two bar-specific dims already contain them (with the extra bar identity).
 CONTACT_FAMILY = ("dual_hcontact", "support_dual_contact")
+
+# ---- 9.74: the BAR-AGNOSTIC load family ------------------------------------ #
+# `support_dual_contact` proved that a *bar-specific* load term (f_{h,gk}) removes
+# the hovering pathology on the instructed bar, and also proved the cost: on the
+# goal=B2 probe the robot dives straight at B2 and NEVER touches B1 before it
+# (0 steps on B1 vs 17-19 for the bar-agnostic `support_dual` baseline), 56% of
+# its live phase airborne.  The goal said "be loaded on B2"; B1 earned nothing.
+#
+# The baseline's B2 failure is a *load* failure, measured directly (goal-bar 2,
+# 50 M steps, live phase, left hand at B2): it is inside B2's 5 cm window for
+# 25-33% of the steps but carries load there for only 0-15%, with 0-9 steps of
+# pure hover -- i.e. the distance criteria (`c` = 0.47-0.82, "in contact") do not
+# make the hand actually grip.
+#
+# So the two fixes are orthogonal and both are needed:
+#   * BAR-AGNOSTIC (this family): credit any bar, so the B1 stepping stone keeps
+#     paying -- no dive, no dependence on the sampled instruction bar;
+#   * LOAD-GATED: "in a window" alone is not a grip (the CONTACT_F0 threshold).
+# With the per-hand boolean
+#     g_h = (d[h, argmin_k d[h,k]] < GRASP_THRESH)  AND  (EMA_5(F_h) > F0*theta)
+# (i.e. "this hand is really loaded, on whichever bar it is on"), the trio is
+#
+#   h_any_load  : 1-exp(-S/10), S = steps with ANY hand's g_h
+#   h_dual_load : same, with BOTH hands loaded AND inside the SAME bar's window
+#   h_both_load : same, with BOTH hands loaded (on whatever bars)
+#
+# `h_any_load` is the load version of `h_any`; `h_dual_load` of `h_dual`.  They
+# are ADDED to `support_dual` rather than replacing anything: run #18 showed that
+# deleting the continuous grip term collapses training (9.50), and the distance
+# versions are what let the chain form in the first place.  `h_both_load` is the
+# one term that targets the REACHING hand during a hand-over -- `h_any_load` is
+# already satisfied by the supporting hand, and `h_dual_load` says nothing about
+# which hand, so neither can demand that the hand that just arrived takes load.
+LCONTACT_FAMILY = ("support_dual_lc", "support_dual_lcb")
 # `hold = 1 - exp(-streak / HOLD_TAU)` where `streak` is the number of consecutive
 # steps with at least one hand inside the grasp window of some bar (< GRASP_THRESH,
 # the same criterion as bar_L/bar_R/max_bar -- NOT max(c) > 0.5, which would call a
@@ -376,6 +417,8 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     # and therefore previously saved checkpoints -- are untouched for every other
     # variant.
     contact = nxt(2) if goal_variant in CONTACT_FAMILY else slice(i, i)
+    # 9.74 bar-agnostic load trio (no k_goal dependence)
+    lcontact = nxt(3) if goal_variant in LCONTACT_FAMILY else slice(i, i)
     # "park": how long the TORSO has been inside some bar's hang box (history)
     park = nxt(1) if goal_variant == "park" else slice(i, i)
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
@@ -393,6 +436,12 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         # load instead of distance (single-variable swap, see CONTACT_FAMILY).
         goal_indices = goal_indices + (cnext.start, cnext.start + 1,
                                        contact.start, contact.start + 1)
+    elif goal_variant in LCONTACT_FAMILY:
+        # [x, z, p(6), max(c), h_any, h_dual] + [h_any_load, h_dual_load(, h_both_load)]
+        base = (grasp_support.start, hold.start, hold_dual.start,
+                lcontact.start, lcontact.start + 1)
+        goal_indices = goal_indices + (base if goal_variant == "support_dual_lc"
+                                       else base + (lcontact.start + 2,))
     elif goal_variant == "support_dual_contact":
         # [x, z, p(6), max(c), h_any, h_dual, f_L,gk, f_R,gk]  (13)
         goal_indices = goal_indices + (grasp_support.start, hold.start,
@@ -450,7 +499,7 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
                          grasp_support, hold, hold_dual, cnext, hnext, dnext, contact,
-                         park, cross, prev_action,
+                         lcontact, park, cross, prev_action,
                          advance, kref, i, tuple(goal_indices))
 
 
@@ -544,6 +593,9 @@ class Brachiation(Env):
              # 9.72: real-contact sustained dims (superset 34, 35 = f_L,gk, f_R,gk)
              "dual_hcontact": _pos + [28, 29, 34, 35],
              "support_dual_contact": _pos + [10, 19, 20, 34, 35],
+             # 9.74 bar-agnostic load trio (superset 36, 37, 38)
+             "support_dual_lc": _pos + [10, 19, 20, 36, 37],
+             "support_dual_lcb": _pos + [10, 19, 20, 36, 37, 38],
              "dual6c": [0, 1, 28, 29, 30, 31],
              "dual6d": [0, 1, 32, 33, 30, 31],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
@@ -644,7 +696,8 @@ class Brachiation(Env):
                             0.0, 0.0,                          # c_L,next / c_R,next = 1
                             0.0, 0.0,                          # h_L,next / h_R,next = 1
                             0.0, 0.0,                          # d_L,next / d_R,next = 0
-                            0.0, 0.0],                         # f_L,next / f_R,next = 1
+                            0.0, 0.0,                          # f_L,next / f_R,next = 1
+                            0.0, 0.0, 0.0],                    # load trio = 1 (settled)
                          dtype=np.float32)
         keep = np.asarray(self._goal_full_idx)
         if self.goal_variant in CROSS_FAMILY:
@@ -938,7 +991,9 @@ class Brachiation(Env):
                 "hold_feature": jnp.zeros(()),
                 # 9.72 contact-streak state (2,) + the EMA of the raw finger load
                 "contact_streak": jnp.zeros((2,)),
-                "contact_ema": jnp.zeros((2,))}
+                "contact_ema": jnp.zeros((2,)),
+                # 9.74 bar-agnostic load trio streaks [any, dual, both]
+                "lcontact_streak": jnp.zeros((3,))}
 
     def _state_features(self, data, prev_action: jnp.ndarray,
                         hold: jnp.ndarray = 0.0, kref: jnp.ndarray = 0.0,
@@ -947,7 +1002,8 @@ class Brachiation(Env):
                         park: jnp.ndarray = 0.0,
                         k_goal: jnp.ndarray = 0.0,
                         hnext: jnp.ndarray = 0.0,
-                        contact: jnp.ndarray = 0.0) -> jnp.ndarray:
+                        contact: jnp.ndarray = 0.0,
+                        lcontact: jnp.ndarray = 0.0) -> jnp.ndarray:
         d, w = self._grasp(data)
         dmin = d.min(axis=-1)
         c = jnp.exp(-(dmin / TAU_CONTACT) ** 2)          # soft "grasping" indicator
@@ -974,6 +1030,9 @@ class Brachiation(Env):
             # through _hold_feature in `step`), exactly like `hnext`: it is a
             # function of the REAL finger load, not of the instantaneous state.
             parts.append(jnp.broadcast_to(jnp.asarray(contact, jnp.float32), (2,)))
+        if self.goal_variant in LCONTACT_FAMILY:
+            # 9.74: bar-agnostic load trio, also history (info["lcontact_streak"])
+            parts.append(jnp.broadcast_to(jnp.asarray(lcontact, jnp.float32), (3,)))
         if self.goal_variant == "park":
             # only the parked streak is added: x_torso and z_torso are already
             # features 0 and 2 of the base block
@@ -1047,7 +1106,9 @@ class Brachiation(Env):
                                # 9.72 contact family: at the canonical hang both
                                # hands are clamped on the bar and carry 40 N m, so
                                # the sustained-contact-strength entry is settled at 1
-                               [1.0, 1.0]]).astype(np.float32)
+                               [1.0, 1.0],
+                               # 9.74 bar-agnostic load trio: same convention
+                               [1.0, 1.0, 1.0]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -1069,7 +1130,8 @@ class Brachiation(Env):
                        park: jnp.ndarray = 0.0,
                        k_goal: jnp.ndarray = 0.0,
                        hnext: jnp.ndarray = 0.0,
-                       contact: jnp.ndarray = 0.0) -> jnp.ndarray:
+                       contact: jnp.ndarray = 0.0,
+                       lcontact: jnp.ndarray = 0.0) -> jnp.ndarray:
         # `hold` means "the sustained-contact scalar this variant uses":
         #   support_hold -> at least one hand on ANY bar
         #   advance      -> at least one hand on the NEXT bar
@@ -1098,7 +1160,9 @@ class Brachiation(Env):
             jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,)),   # 30, 31
             self._dnext(d, k_goal),                            # indices 32, 33
             # 9.72: the two real-contact sustained dims (see CONTACT_FAMILY)
-            jnp.broadcast_to(jnp.asarray(contact, jnp.float32), (2,))])  # 34, 35
+            jnp.broadcast_to(jnp.asarray(contact, jnp.float32), (2,)),   # 34, 35
+            # 9.74: bar-agnostic load trio
+            jnp.broadcast_to(jnp.asarray(lcontact, jnp.float32), (3,))])  # 36, 37, 38
         return full[self._goal_full_idx]
 
     def _achieved_goal_info(self, data, info) -> jnp.ndarray:
@@ -1119,7 +1183,8 @@ class Brachiation(Env):
             self._hold_feature(info["park_streak"]),
             info["k_goal"],
             self._hold_feature(info["hpair_streak"]),
-            self._hold_feature(info["contact_streak"]))
+            self._hold_feature(info["contact_streak"]),
+            self._hold_feature(info["lcontact_streak"]))
 
     def _cnext(self, d: jnp.ndarray, k_goal: jnp.ndarray) -> jnp.ndarray:
         """[c_L,gk, c_R,gk]: per-hand soft contact with the INSTRUCTION GOAL BAR.
@@ -1278,7 +1343,8 @@ class Brachiation(Env):
                                   0.0, self._hold_feature(0.0), self._hold_feature(0.0),
                                   jnp.asarray(gk, dtype=jnp.float32),
                                   self._hold_feature(jnp.zeros((2,))),
-                                  self._hold_feature(jnp.zeros((2,)))), goal])
+                                  self._hold_feature(jnp.zeros((2,))),
+                                  self._hold_feature(jnp.zeros((3,)))), goal])
         # JaxGCRL's evaluator hardcodes these five names:
         #   reward, success, success_easy, dist, distance_from_origin
         # (see jaxgcrl/utils/evaluator.py).  Everything else is our own.
@@ -1382,6 +1448,20 @@ class Brachiation(Env):
         contact_now = near_goal * loaded
         contact_streak = jnp.where(contact_now > 0, state.info["contact_streak"] + 1.0, 0.0)
         contact = self._hold_feature(contact_streak)
+        # ---- 9.74: the BAR-AGNOSTIC load trio --------------------------------
+        # `grip_now[h]` = "hand h is really loaded, on whichever bar it is on":
+        # the distance gate uses the hand's NEAREST bar (dmin), not the instruction
+        # bar, which is what makes this family instruction-independent (so
+        # --train-goal-bar no longer changes the training distribution) and what
+        # keeps the *stepping stone* paying -- the goal=B2 dive of
+        # `support_dual_contact` came precisely from aiming the load term at B2.
+        grip_now = ((dmin < GRASP_THRESH) & (load > self.contact_thresh)).astype(jnp.float32)
+        same_bar = jnp.any((d[0] < GRASP_THRESH) & (d[1] < GRASP_THRESH))
+        l_now = jnp.stack([(jnp.max(grip_now) > 0).astype(jnp.float32),
+                           (same_bar & (jnp.min(grip_now) > 0)).astype(jnp.float32),
+                           (jnp.min(grip_now) > 0).astype(jnp.float32)])
+        lcontact_streak = jnp.where(l_now > 0, state.info["lcontact_streak"] + 1.0, 0.0)
+        lcontact = self._hold_feature(lcontact_streak)
 
         # progress = how many bars this episode has advanced (raw count, so one
         # bar is worth ~1.0 in the goal distance -- the same order as a contact
@@ -1391,12 +1471,13 @@ class Brachiation(Env):
         # policy to keep going.
         progress = k_ref - state.info["k_start"]
         feats = self._state_features(data, action, hold, k_ref, progress, hold_dual,
-                                     h_park, state.info["k_goal"], hpair, contact)
+                                     h_park, state.info["k_goal"], hpair, contact,
+                                     lcontact)
         goal = state.info["goal"]
         obs = jnp.concatenate([feats, goal])
 
         achieved = self._achieved_goal(data, hold, k_ref, progress, hold_dual, h_park,
-                                       state.info["k_goal"], hpair, contact)
+                                       state.info["k_goal"], hpair, contact, lcontact)
         dist = jnp.linalg.norm(achieved - goal)
         success = (dist < self.goal_reach_thresh).astype(jnp.float32)
         slow = jnp.linalg.norm(data.qvel) < 1.0
@@ -1444,6 +1525,7 @@ class Brachiation(Env):
                     dual_streak=dual_streak, park_streak=park_streak,
                     hpair_streak=hpair_streak,
                     contact_streak=contact_streak, contact_ema=load,
+                    lcontact_streak=lcontact_streak,
                     # the resolved `hold` value this step used (variant-dependent
                     # source, so record it rather than re-derive it on read)
                     hold_feature=hold,

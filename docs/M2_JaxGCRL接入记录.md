@@ -4183,3 +4183,100 @@ thresh 0.35，**`--expl-hold 10`** ✓，`buffer_gb 1.0`，`xla 0.6`）。
 * `runs/render/contact_2bar_g1/contact_2bar_g1.gif`（4 路并排，5.2 s/段）+ `trace.csv`（含 `f/near/load/hover`）
 * `runs/render/contact_2bar_g2/contact_2bar_g2.gif`（10 s/段）+ `trace.csv`
 * `runs/brach_contact_2bar_6h/progress.csv`（60 evals）+ `runs/ckpt_contact_2bar_6h/`（12 个 checkpoint）
+
+### 9.75 「Bar-specific 的 contact 会跳过 B1」——实测确认，以及 bar-agnostic 版的实现
+
+用户观察：**只针对 B2 的 contact 项让机器人直接扑 B2、跳过 B1**。用已有的两份 trace 直接量：
+
+| `--goal-bar 2`（存活期）| 先碰 B2 前在 B1 上的步数 | 腾空占比 | 最长连续腾空 |
+|---|---|---|---|
+| **新**（`support_dual_contact`，bar-specific）| **0 / 0 / 0 / 0**（4/4 都是 0）| **56%** | 27–32 步 |
+| 基线（`support_dual`，bar-agnostic，50 M）| **17 / 18 / 19 / 18** | 12% | 2–6 步 |
+
+新臂的 run 序列是 `00x10 0-1x7 -1-1x2 0-1x16 -1-1x3 … 2-1x4`：右手吊 B0、左手乱摆，
+然后**两手同时松开 27–32 步**做弹道式前扑，只在最后碰到 B2。**"跳步"是真的**，
+原因是 bar-specific 项把目标写成"在 B2 上承力"，B1 一分不拿。
+（对照：同一个策略 `--goal-bar 1` 时腾空只有 10%，并且把 B1 抓了 427/502 步——
+所以它不是不会链，是**目标没让它链**。）
+
+#### 9.75.1 「没有 contact 项只是训练时长不够？」——一半对
+
+把基线 `ckpt_dual2bar_6h` 的 **B2 探针**按训练步数排开（同一渲染脚本）：
+
+| 步数 | max_bar | 存活 | 到 B2 最近距离 | 腾空占比 | 先碰 B2 前在 B1 的步数 |
+|---|---|---|---|---|---|
+| 13.5 M | 1（**从未到 B2**）| t 38–76 | 0.067–0.545 | 36% | 0 |
+| 26.0 M | 2 | t 32–63 | **0.005** | 8% | 18 / 19 |
+| 38.5 M | 2 | t 52–117 | **0.002** | 22% | 17 / 19 |
+| 50.1 M | 2 | t 57–61 | **0.001** | 12% | 17–19 |
+
+⇒ **"到达"确实靠训练时长解决**（0/4 → 4/4 个 episode 摸到 B2；最近距离 0.067 → 0.001 m；
+16→50 M 步之间还在改善），但**"守住"一点没改善**：`fell` 始终 100%、存活始终 57–61 步。
+所以不是"再跑久一点就有"。
+
+#### 9.75.2 缺的到底是什么：把载荷量出来
+
+给渲染脚本加了"**所有变体都输出 `f/near/load/hover`**"之后，基线 @50 M、`--goal-bar 2`、存活期、
+**左手**在 B2 上的读数（`near` = 座在 5 cm 窗内；`f>0.5` = 真承力）：
+
+| ep | 在窗内 | **真承力** | **纯悬停** | 在窗内的载荷 | 在窗内的 `c` |
+|---|---|---|---|---|---|
+| 0 | 25% | **0%** | 8 步 | 13.0 N·m | 0.54 |
+| 1 | 33% | 8% | 9 步 | 16.3 N·m | 0.71 |
+| 2 | 25% | 15% | 0 | 25.8 N·m | 0.47 |
+| 3 | 26% | 9% | 4 步 | 22.4 N·m | 0.82 |
+
+⇒ 手有 **1/4–1/3 的时间在 B2 的窗内，但其中只有 0–15% 真的承力**，而承的那点载荷是
+**13–26 N·m 的轻蹭**（真实悬垂是 40–70）。`c` 全程 0.47–0.82（"看起来在接触"）。
+**这就是"距离判据"漏掉的东西，也正是接触量要补的**。
+
+#### 9.75.3 实现：bar-agnostic + load-gated 的新家族（`support_dual_lc` / `support_dual_lcb`）
+
+两个修法是**正交的、都要**：bar-agnostic 保住"B1 这块踏脚石也算数"（不跳步、且不依赖被采样的指令杆），
+load-gated 补上"在窗内 ≠ 抓住"。用每只手的布尔量
+
+```
+g_h = (d[h, argmin_k d[h,k]] < 0.05)  AND  (EMA_5(F_h) > F0*theta)     # 杆无关！
+```
+
+| 变体 | goal | 维数 |
+|---|---|---|
+| **`support_dual_lc`** | `support_dual` + `[h_any_load, h_dual_load]` | 13（state 147 / obs 160）|
+| **`support_dual_lcb`** | 上面 + `[h_both_load]` | 14（state 147 / obs 161）|
+
+* `h_any_load` / `h_dual_load` 是 `h_any` / `h_dual` 的**载荷版**（同杆双手 = `both g_h` 且在同一根杆窗内）；
+* `h_both_load` = **两手都承力（可以不在同一根杆上）**。这是唯一能对**正在换手的那只手**提要求的项：
+  换手过程中 `h_any_load` 已被支撑手满足、`h_dual_load` 又不说"哪只手"，只有它在说
+  "你刚够到的那只手必须真的吃上力"；
+* 三者**只在 `support_dual` 上做加法**，不删任何东西——run #18 已经证明删掉连续抓握项会让训练崩（§9.50），
+  而距离版正是链得以形成的原因；
+* 全部**不含 `k_goal`**，所以这两个变体的训练分布重新与 `--train-goal-bar` 无关（回到 §9.52 之前的好性质）。
+
+**CPU 验收（`src/check_contact_sense.py`，19 条断言，两个变体都过）**：
+
+| 臂 | 设置 | `[any, dual, both]` | 含义 |
+|---|---|---|---|
+| P | 双手闭合吊 B0 | **[0.92, 0.92, 0.92]** | 真双手承力 ⇒ 三项都满 |
+| **P2** | 双手闭合、goal=**B1**（人在 B0）| **[0.92, 0.92, 0.92]** | **抓在"错杆"上照样算数** —— 这就是 bar-agnostic，B1 这块踏脚石因此能拿分 |
+| H | 左手张开、右手闭合 | **[0.87, 0, 0]** | only-one-hand ⇒ `both`=0，正是"要求够到的那只手吃上力" |
+| N | 松手坠落 | **[0, 0, 0]** | 无接触 |
+
+守卫：`check_variants` 21/21 自洽、`check_metrics`/`check_args` 通过、
+`check_contact_sense`（`support_dual`/`support_dual_contact`/`_lc`/`_lcb` 四组）全过。
+
+#### 9.75.4 建议的下一跑（与 6h 基线**逐项同配方**，只改 goal 变体）
+
+```bash
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce \
+  --goal-variant support_dual_lcb --goal-reach-thresh 0.35 \
+  --train-goal-bar -1 --train-goal-bar-min 1 --train-goal-bar-max 2 --start-bar-max 1 \
+  --eval-goal-bar 1 --scene full035 \
+  --num-envs 128 --num-eval-envs 16 --episode-length 501 --batch-size 512 \
+  --steps 50131712 --num-evals 60 --expl-hold 10 --save-every 5 \
+  --buffer-gb 1.0 --xla-mem-fraction 0.6 --gpu 0 \
+  --exp-name brach_lboth_2bar_6h --checkpoint-dir runs/ckpt_lboth_2bar_6h \
+  --wandb --wandb-group .
+```
+
+判读（与 `dual2bar_6h` 对照）：`--goal-bar 2` 渲染里 (a) **先碰 B2 前是否仍有 17–19 步在 B1 上**
+（bar-agnostic 是否保住了踏脚石）、(b) **B2 的 `f>0.5` 步占比是否从 0–15% 上去**、(c) 存活是否超过 57–61 步。

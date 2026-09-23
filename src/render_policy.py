@@ -164,14 +164,16 @@ def main() -> int:
     # (shape (E,)), so masking with it afterwards silently collapses to the final
     # all-fallen vector.
     rec["live"] = np.zeros((T + 1, E), dtype=np.float32)
-    # 9.72: the contact family's whole question is "is the hand on the instructed
-    # bar HOVERING (in the window, no load) or really GRIPPING (carrying load)?"
-    # -- so record the load and the two gates, not just the distance.
-    uses_contact = "contact" in variant
-    if uses_contact:
-        rec.update({k: np.zeros((T + 1, E), dtype=np.float32)
-                    for k in ("f_L", "f_R", "near_L", "near_R", "load_L", "load_R",
-                              "hover_L", "hover_R")})
+    # 9.72/9.74: "is the hand on the instructed bar HOVERING (in the window, no
+    # load) or really GRIPPING (carrying load)?" is worth recording for EVERY
+    # variant, not just the contact family: the env computes the load streaks for
+    # all of them (`info["contact_ema"]`, `cov_load_*`), and asking the same
+    # question of the distance-based baselines is how we tell whether THEIR
+    # failure at the second bar is a missing-load problem or something else.
+    uses_contact = True
+    rec.update({k: np.zeros((T + 1, E), dtype=np.float32)
+                for k in ("f_L", "f_R", "near_L", "near_R", "load_L", "load_R",
+                          "hover_L", "hover_R")})
 
     def snapshot(i, s, ever_done):
         qpos[i] = np.asarray(s.pipeline_state.qpos)

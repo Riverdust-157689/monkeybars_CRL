@@ -158,6 +158,7 @@ def parse() -> argparse.Namespace:
                              "dual_nomax", "dual_cnext", "dual_hnext",
                              "dual_hnext_max", "dual_hnext_dual",
                              "dual_hcontact", "support_dual_contact",
+                             "support_dual_lc", "support_dual_lcb",
                              "dual6c", "dual6d", "park", "position",
                              "cross", "cross3", "hold2", "advance"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
