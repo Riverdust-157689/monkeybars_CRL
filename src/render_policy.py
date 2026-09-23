@@ -110,6 +110,8 @@ def main() -> int:
     if impl == "warp":
         mb.enable_warp_compat()
     goal_bar = None if args.goal_bar < 0 else args.goal_bar
+    # the trace's d_* columns / closest-hand summary are relative to this bar
+    k_goal = int(goal_bar) if goal_bar is not None else 1
     # must match training, otherwise the actor's input width is wrong
     variant = cfg.get("goal_variant") or ("position" if cfg.get("goal_position_only") else "full")
     window = cfg.get("action_window", "reach")
@@ -208,9 +210,11 @@ def main() -> int:
         rec["c_L"][i] = np.exp(-(dmin[:, 0] / 0.04) ** 2)
         rec["c_R"][i] = np.exp(-(dmin[:, 1] / 0.04) ** 2)
         rec["bar_L"][i], rec["bar_R"][i] = bar[:, 0], bar[:, 1]
-        # per-hand distance to bar 1 -> answers "which hand is the one that reaches"
+        # per-hand distance to the INSTRUCTION bar (9.69: it used to be hardcoded to B1,
+        # which silently reported B1 distances when rendering with --goal-bar 2+)
         if d.shape[-1] > 1:
-            rec["d_LB1"][i], rec["d_RB1"][i] = d[:, 0, 1], d[:, 1, 1]
+            _k = k_goal
+            rec["d_LB1"][i], rec["d_RB1"][i] = d[:, 0, _k], d[:, 1, _k]
         rec["switched"][i] = np.asarray(s.metrics["hand_switches"])
         rec["done"][i] = np.asarray(s.done)
         return ever_done | (np.asarray(s.done) > 0)
@@ -238,7 +242,7 @@ def main() -> int:
     if "d_LB1" in rec:
         L1, R1 = rec["d_LB1"].min(axis=0), rec["d_RB1"].min(axis=0)
         who = ["left" if l < r else "right" for l, r in zip(L1, R1)]
-        print(f"[result] closest hand to B1 per episode = {who}  "
+        print(f"[result] closest hand to B{k_goal} per episode = {who}  "
               f"(L {np.round(L1,3).tolist()} vs R {np.round(R1,3).tolist()}, threshold 0.05)")
     print(f"[result] grasping (soft) = L {rec['c_L'].mean():.2f}  R {rec['c_R'].mean():.2f} "
           f"(1 = closed on the bar)")
