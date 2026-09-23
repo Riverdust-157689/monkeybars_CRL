@@ -90,10 +90,10 @@ index 6cc7996..d1a5e88 100644
          logging.info("total steps: %s", total_steps)
  
 diff --git a/jaxgcrl/utils/evaluator.py b/jaxgcrl/utils/evaluator.py
-index 1ff4a94..f3b94aa 100644
+index 1ff4a94..8694a70 100644
 --- a/jaxgcrl/utils/evaluator.py
 +++ b/jaxgcrl/utils/evaluator.py
-@@ -133,7 +133,41 @@ class ActorEvaluator:
+@@ -133,7 +133,53 @@ class ActorEvaluator:
                          "success_easy",
                          "dist",
                          "distance_from_origin",
@@ -128,6 +128,18 @@ index 1ff4a94..f3b94aa 100644
 +                        "cov_park_runmax_improve",
 +                        "cov_park_hold_sum",
 +                        "cov_single_on_steps",
++                        # 9.72: real-contact readouts (finger load from
++                        # data.qfrc_constraint) -- see src/check_contact_sense.py
++                        "cov_contact_L_on_steps",
++                        "cov_contact_R_on_steps",
++                        "cov_contact_both_on_steps",
++                        "cov_contact_runmax_improve",
++                        "cov_near_L_on_steps",
++                        "cov_near_R_on_steps",
++                        "cov_hover_L_on_steps",
++                        "cov_hover_R_on_steps",
++                        "cov_load_L",
++                        "cov_load_R",
 +                        # M4: how many bars the episode advanced (sustained grips)
 +                        "advance_max",
                      ]

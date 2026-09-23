@@ -157,6 +157,7 @@ def parse() -> argparse.Namespace:
                     choices=["full", "support", "support_hold", "support_dual",
                              "dual_nomax", "dual_cnext", "dual_hnext",
                              "dual_hnext_max", "dual_hnext_dual",
+                             "dual_hcontact", "support_dual_contact",
                              "dual6c", "dual6d", "park", "position",
                              "cross", "cross3", "hold2", "advance"],
                     help="full = [x,z,p_L(3),p_R(3),c_L,c_R] (10-D, requires BOTH hands); "
@@ -191,6 +192,22 @@ def parse() -> argparse.Namespace:
                          "the relabelled goals.")
     ap.add_argument("--goal-position-only", type=int, default=0,
                     help="deprecated alias for --goal-variant position")
+    ap.add_argument("--contact-f0", type=float, default=40.0,
+                    help="9.72 contact family: reference finger load (N.m) of one "
+                         "hand of a validated hang -- measured 40 on the static "
+                         "keyframe and 48-68 through the control loop.  Only used by "
+                         "--goal-variant dual_hcontact/support_dual_contact.")
+    ap.add_argument("--contact-theta", type=float, default=0.3,
+                    help="9.72: 'loaded' cutoff as a fraction of --contact-f0 -> "
+                         "threshold 12 N.m.  Measured band: a hand merely BRUSHING "
+                         "the bar (fingers open) peaks at 9.5 (=> theta > 0.24), a "
+                         "one-handed swinging hang bottoms at 37.7 (=> theta < 0.47); "
+                         "0.3 sits near the centre.  See src/check_contact_sense.py.")
+    ap.add_argument("--contact-ema", type=float, default=5.0,
+                    help="9.72: EMA time constant in control steps applied to the "
+                         "raw finger load BEFORE thresholding (alpha = 1/value); "
+                         ">= 1.  Smooths a single-step graze so it cannot latch the "
+                         "sustained-contact streak.")
     ap.add_argument("--discounting", type=float, default=0.995)
     ap.add_argument("--expl-hold", type=int, default=1,
                     help="hold one exploration perturbation for K control steps "
@@ -312,7 +329,7 @@ def main() -> int:
     from envs.brax_ext import wrap as mjx_wrap
     brax_envs.training.wrap = mjx_wrap
 
-    from envs.brachiation import create_brachiation
+    from envs.brachiation import GRASP_THRESH, create_brachiation
     from jaxgcrl.agents.crl import CRL
     from jaxgcrl.utils.config import Config, RunConfig
 
@@ -325,6 +342,9 @@ def main() -> int:
                       goal_reach_thresh=args.goal_reach_thresh,
                       goal_variant=goal_variant,
                       action_window=args.action_window,
+                      contact_f0=args.contact_f0,
+                      contact_theta=args.contact_theta,
+                      contact_ema=args.contact_ema,
                       start_bar_max=args.start_bar_max,
                       goal_ahead=bool(args.goal_ahead),
                       goal_ahead_max=int(args.goal_ahead_max),
@@ -372,6 +392,12 @@ def main() -> int:
     print(f"[goal] variant={train_env.goal_variant} goal_size={train_env.goal_size} "
           f"state_dim={train_env.state_dim} obs={train_env.observation_size} "
           f"indices={train_env.goal_indices}")
+    if "contact" in train_env.goal_variant:
+        print(f"[contact] REAL load sensing active: f_h,gk = 1-exp(-streak/10), "
+              f"streak = (d[h,gk] < {GRASP_THRESH:g} m) AND "
+              f"(EMA_{train_env.contact_ema:g}(Sum|qfrc_constraint|_h) > "
+              f"{train_env.contact_f0:g} x {train_env.contact_theta:g} = "
+              f"{train_env.contact_thresh:.1f} N.m)")
     if is_cross:
         instr = f"FIXED single goal ({train_env.goal_variant})"
         ev_instr = "same single goal"
@@ -514,6 +540,15 @@ def main() -> int:
                            goal_variant=str(train_env.goal_variant),
                            goal_size=int(train_env.goal_size),
                            action_window=str(train_env.action_window),
+                           # 9.72: the contact family's goal dims are a function of
+                           # these three, so a render MUST rebuild them from here
+                           # (otherwise the actor's input width still matches but
+                           # the goal distance is computed with a different
+                           # threshold -- the same class of silent mismatch that
+                           # render_policy's uses_hpair bug was).
+                           contact_f0=float(train_env.contact_f0),
+                           contact_theta=float(train_env.contact_theta),
+                           contact_ema=float(train_env.contact_ema),
                            start_bar_max=int(args.start_bar_max),
                            train_goal_bar_min=int(args.train_goal_bar_min),
                            train_goal_bar_max=int(train_env.goal_bar_max),

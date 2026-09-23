@@ -154,5 +154,10 @@ PY
 echo "== 5/5 static guards (run these before every GPU run) =="
 "$PY" src/check_args.py  | tail -1
 "$PY" src/check_metrics.py | tail -1
+"$PY" src/check_variants.py | tail -1
+# `--deep` is the guard that catches a goal readout that disagrees with step()
+# (it compiles a step per variant, ~1 min); the contact controls need the CPU
+# platform explicitly so warp does not try to initialise a CUDA device.
+JAX_PLATFORMS=cpu "$PY" src/check_contact_sense.py | tail -1
 echo
 echo "done.  Next: docs/复现环境.md (GPU/Warp notes, run commands, what is not tracked)."

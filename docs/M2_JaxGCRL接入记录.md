@@ -3582,7 +3582,9 @@ t=113–125 **吊在 B1 上约 13 步**（其间 `d_LB1` 在 1.4–5.4 cm 之间
    换成"每手对目标杆"。它同时保留 #17 里被证明有效的三件（`p`、杆无关 `max(c)`）与 §9.52 想修的漏洞
    （`h` 不再被起始杆白送）。**预测**：双持占比应回到 #17 的水平（>80%）；若反而掉到 13% 附近，
    说明"终态双持"靠的是 `h_dual` 的"同杆"语义，而不是 `h` 的参照物。
-2. 让 `dual_hnext` 继续跑（或重跑到 100 evals）看后 1/3 的回退是否会自行恢复。### 9.66 给"魔力"归因的两个单变量实验：`dual_hnext_max` / `dual_hnext_dual`
+2. 让 `dual_hnext` 继续跑（或重跑到 100 evals）看后 1/3 的回退是否会自行恢复。
+
+### 9.66 给"魔力"归因的两个单变量实验：`dual_hnext_max` / `dual_hnext_dual`
 
 §9.66 前的观察：八条 run 摊开后，`max(c)` 的"魔力"看起来不是任务层面的要求，而是**抓握深度**
 （渲染实测 soft grasp：#17 = 0.89/0.88；`dual_hnext` = 0.58/**0.12**；#18/#19 = 0.03–0.12）。
@@ -3787,7 +3789,9 @@ S_dual   = 连续满足 "两手 s_h > θ 且 argmin_k d[L,k] == argmin_k d[R,k]"
 * 阈值需重调（新维度会让"已吊在目标杆下"的 dist 变化），CPU 校验 + `check_variants` 守卫照旧。
 
 **风险**：① `qfrc_constraint` 含限位/等式项（需复核）；② 首次触碰瞬间信号稀疏（用 10 步时间常数平滑）；
-③ `F0` 的标定（按实测 40 量级取 5–10）。### 9.71.1 接触特征的标定：`F0` 按"关键帧双手悬垂"标定，`θ` 取 0.3（+5 步 EMA 防抖）
+③ `F0` 的标定（按实测 40 量级取 5–10）。
+
+### 9.71.1 接触特征的标定：`F0` 按"关键帧双手悬垂"标定，`θ` 取 0.3（+5 步 EMA 防抖）
 
 **先说一条测量结论（它决定了标定方式）**：把手指 DOF 的载荷 `F` 按"手到**最近**杆的距离"分档
 （rollout 2154 步，用两杆课程 6h 的策略，goal_bar∈{1,2}）：
@@ -3825,3 +3829,161 @@ S_dual   = 连续满足 "两手 s_h > θ 且 argmin_k d[L,k] == argmin_k d[R,k]"
 **顺带一个重要旁证**：既然"座离轴 5 cm 仍可能实打实挂着"，那么现在所有基于 `dmin`/5 cm 窗的判据
 （`h_any`、`h_dual`、`max(c)`）**比我们原先以为的更弱**——它们既可能把"真挂着"判成"没抓"，
 也可能把"贴着但不承力"判成"抓住了"。接触量两头都修。
+
+### 9.72 实现并验收：真实接触项 `f_{h,gk}`（`dual_hcontact` / `support_dual_contact`）
+
+按 §9.70.1 的草案 + §9.71.1 的标定实现完毕。**两处对 §9.71.1 的修正**写在最前面，因为它们影响读数方式。
+
+#### 9.72.1 修正一：40.1/41.0 是**静态关键帧**的值，控制回路里的悬垂是 **48–68 N·m**
+
+§9.70 的 40.1/41.0 是在关键帧上取一帧 `qfrc_constraint` 得到的。让机器人**真的通过 `env.step`
+（位置伺服 + 10 帧物理子步）吊住**之后，手指 DOF 的 EMA 载荷是：
+
+| 状态（`src/check_contact_sense.py` 实测，full035）| 手指载荷 (N·m) |
+|---|---|
+| 双手闭合悬垂 B0（关键帧姿态，正对照）| min **48.1** / p50 65–67 / max 68 |
+| 单手悬垂（左手张开、右手承力）支撑手 | min **37.7**（冷启动后）/ p50 59 / max 68 |
+| 单手悬垂时的**悬停手**（座在 B0 窗口内、手指张开）| max **9.5**，p50 **3.1** |
+| 松手后（跳过释放瞬态）| max **0.9** |
+| 闭合但**抓在错误的杆**上（goal=B1 而机器人在 B0）| min **52.8**（载荷照旧，只是杆不对）|
+
+⇒ `F0 = 40` 作为**标定基准**仍然合理（它复现了关键帧、且 337.5 N = 体重交叉验证），
+但"真实抓握"的实际下沿是 **37.7**（单手摆动）而不是 40。于是阈值的可行区间是：
+
+* **下界**：手指张开的"轻擦"峰值 **9.5** ⇒ `θ > 9.5/40 = 0.24`，否则悬停会被判成抓住；
+* **上界**：单手摆动悬垂的最低点 **37.7** ⇒ `θ < 0.47`，否则真实承力会 flicker（θ=0.4 已开始丢步，
+  θ=0.5/0.6 连双手悬垂的 `obs` 都会因为冷启动+摆动掉到 0.85–0.91）。
+
+**取 `θ = 0.3`（阈值 12.0 N·m）**：高于轻擦 1.26×，低于单手摆动 3.1×，低于双手悬垂 4.0×。
+
+**θ 扫描（18 条对照全过 = 可行）**，实测表（`--contact-theta`，其余不变，20 步/臂）：
+
+| `θ` | 阈值 | 18 条对照 | 失败的那条说明什么 |
+|---|---|---|---|
+| 0.20 | 8.0 | ❌ 2 条 | 轻擦峰值 **9.5** 被算作承力 ⇒ 悬停被判成抓住 |
+| **0.25** | 10.0 | ✅ 全过 | 刚好越过轻擦 |
+| **0.30** | **12.0** | ✅ 全过 | **采用值** |
+| **0.40** | 16.0 | ✅ 全过 | |
+| **0.45** | 18.0 | ✅ 全过 | 2× 裕度的上沿 |
+| 0.50 | 20.0 | ❌ 1 条 | 单手摆动悬垂最低 **37.7** 不再有 2× 裕度 |
+
+⇒ 可行带 **θ ∈ [0.25, 0.45]**（阈值 10–18 N·m），0.3 在其中且偏"绝不把悬停当抓住"一侧；
+这是**实测出来的带**，不是刀尖上的取值。
+
+#### 9.72.2 修正二：特征不能是"载荷超过阈值"，必须是 **(在目标杆窗内) AND (载荷超过阈值)**
+
+载荷本身**说不出是哪根杆**（P2 对照：抓在 B0、goal=B1，载荷 52.8 照旧）。所以：
+
+```
+F_h   = EMA_{5}( Σ_{d ∈ 手 h 的 7 个手指 DOF} |qfrc_constraint[d]| )        # N·m
+s_h   = 连续满足 ( d[h, gk] < 0.05 m ) AND ( F_h > F0·θ ) 的步数
+f_{h,gk} = 1 - exp(-s_h / 10)                                             # 与 hnext 同一映射
+```
+
+* 距离门 = "这根杆"，力判据 = "真的在承力"，两者**缺一不可**；
+* 这也顺带回答了"要不要 `h_any_contact`/`h_dual_contact`"：`max(f_L,f_R)` 与 `min(f_L,f_R)`
+  就是**杆无关**的 any/dual 版本，而且比它们多带了杆身份 ⇒ 两维已覆盖三种读法，不需要四维。
+
+#### 9.72.3 两个变体（都是一次只改一个变量）
+
+| 变体 | goal | 与谁对照 |
+|---|---|---|
+| **`dual_hcontact`** | `[x, z, p(6), c_L,gk, c_R,gk, f_L,gk, f_R,gk]`（12 维）| **`dual_hnext`** 的单变量替换：state 148 / goal 12 / obs 160 **完全相同**，只把两个 `h_·,gk`（距离判据）换成 `f_·,gk`（力判据）|
+| **`support_dual_contact`** | `[x, z, p(6), max(c), h_any, h_dual, f_L,gk, f_R,gk]`（13 维）| §9.69 两杆课程配方（`support_dual`，11 维）+ 同样两维 |
+
+`h_any`/`h_dual` 在 `dual_hcontact` 里保留为**可观测量**（不进 goal），正是为了让它的 state 与
+`dual_hnext` 逐维对齐——否证实验必须只改一个变量。
+
+#### 9.72.4 验收：正/负/悬停/错杆 四对照（`src/check_contact_sense.py`，全部走 `env.step`）
+
+四条臂都由**关键帧姿态 + 动作向量**驱动（`a[:12]=0` 精确复现关键帧手臂 ctrl，
+`a[12+i]=2c-1` 复现抓握协同，`c` = 手指闭合量），因此不经渲染、不绕代码：
+
+| 臂 | 设置 | `contact_L/R` | `near_L/R` | `hover_L/R` | 载荷 |
+|---|---|---|---|---|---|
+| **P** 正对照 | 双手闭合，goal=B0 | **1.00 / 1.00** | 1.00 / 1.00 | 0.00 / 0.00 | 48–68 |
+| **H** 悬停对照 | 左手张开、右手闭合，goal=B0 | **0.00 / 1.00** | **0.37 / 1.00** | **0.37 / 0.00** | 左 ≤9.5，右 ≥37.7 |
+| **N** 负对照 | 双手张开、跳过 15 步释放瞬态 | **0.00 / 0.00** | 0.00 / 0.00 | 0.00 / 0.00 | ≤0.9 |
+| **P2** 错杆对照 | 双手闭合，goal=B1（人在 B0）| **0.00 / 0.00** | 0.00 / 0.00 | 0.00 / 0.00 | 48–68（照旧承力）|
+
+**H 臂是本轮的关键证据**：左手在 B0 的 5 cm 窗内停驻 **11/30 步**，此时
+`hnext`（距离判据）的 `1-exp(-s/10)` **峰值到 0.667**，而 `f`（力判据）**峰值仍是 0.000**。
+把"手放进窗口"从"抓住"里剥出来，正是 §9.70.1 说的病根：
+**goal=B1 时左手贴着杆不抓、以及 `dual_hnext` 后期右手 0.000 m 却 grasp 0.12**，都是这一件事。
+（注意：若策略**持续**把手停在窗内——`dual_hnext` 的右手就是 **413 步**——`hnext` 会一路涨到 ~1.0，
+所以这不是"峰值 0.667 无所谓"，而是"轨迹越长越骗得越狠"。）
+
+18 条断言全过（含"每一维都进 `obs`"的接线检查：`obs[contact]` 在 P 中 0.97、在 H/N/P2 中按预期为 0）。
+复现命令见 `docs/复现环境.md` §4。
+
+#### 9.72.5 顺带修掉的**两个**真 bug（第二个是写这节时被新守卫抓出来的）
+
+**(a) `render_policy.py` 的 `uses_hpair` 被覆盖 ⇒ 四份渲染的 `dist` 报错**
+
+`src/render_policy.py` 里逐变体手拼 `_achieved_goal` 参数的分支中，
+`uses_hpair = variant_cfg in (...)` 的下一行被一句遗留的 `uses_hpair = variant_cfg == "dual_hnext"`
+**覆盖**了。后果：`dual6c`/`dual6d`/`dual_hnext_max`/`dual_hnext_dual` 渲染时 `hnext` 被当成 0，
+`dist` 与 `trace.csv` 的 `dist` 列被高估（每只手最多 +1，两维最多 +√2 ≈ 1.41）。
+
+* **受影响**：`render_dual6c_final`、`render_dual6d_final`、`render_hnext_max`、`render_hnext_dual`
+  的 `dist` / `dist_pos` 数值；它们的行为列（`bar_L/bar_R/d_LB1/d_RB1`）与结论**不受影响**；
+  `render_hnext6h`（真正的 `dual_hnext`）本来就走对了分支，不受影响。
+* **修法**：新增 `env._achieved_goal_info(data, info)`——**唯一**入口，从 `info` 里取全部历史量，
+  `step` 与渲染都调它；整个 `uses_*` 分支群被删掉（`vmap` 直接接受 `(pipeline_state, info)` 字典 pytree），
+  这类"漏传一个历史量"的 bug 从结构上消失。
+
+**(b) 新守卫 `check_variants.py --deep` 立刻抓到同一个 bug 的第二个实例（我自己写的）**
+
+新入口第一版对 `hold` 用的是 `info["hold_streak"]`，但 `step` 对 **`advance`** 用的是
+`info["next_streak"]`（"下一根杆的持续接触"，见 §9.35）。于是 `advance` 的渲染 `dist` 会算错
+—— **正是 (a) 的同一种错，只是换了个变体**。深守卫（3 步真实 `step` 后比对
+`‖_achieved_goal_info(...) − goal‖` 与 `metrics["dist"]`）当场报出 `1.173148 vs 0.961814`。
+
+终态修法是**记录已解析的值**，而不是读的时候再推导一次：`step` 把它本步真正用的 `hold`
+写进 `info["hold_feature"]`，`_achieved_goal_info` 直接读它。19/19 变体现在 `dist` 逐位一致
+（`check_variants.py --deep`，实测输出见 `docs/复现环境.md` §2.4）。
+
+> **教训（值得写进流程）**：goal 的"历史量"参数一旦有多于一个来源，就必须**记录**而不是**重算**。
+> 静态形状守卫（原 `check_variants`）抓不到这类错误——它只看维度；只有"跑几步再和 `step` 自己的
+> `dist` 对账"才抓得到。所以 `--deep` 现在上 GPU 前建议一起跑。
+
+#### 9.72.6 下一步（待跑，1.5 h）
+
+两个候选臂，预算与 #13/#19/#20 同为 20 evals / 1.22e7 步，便于逐 eval 叠曲线：
+
+```bash
+# A) 单变量否证：dual_hnext 的后期回退（右手贴杆不闭合）能不能被力判据修掉
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce --goal-variant dual_hcontact \
+  --train-goal-bar 1 --eval-goal-bar 1 --scene full035 --num-envs 128 --exp-name brach_hcontact_b1
+
+# B) 两杆课程配方 + 接触维（用户要的 B0->B2 主线）
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce --goal-variant support_dual_contact \
+  --train-goal-bar -1 --train-goal-bar-min 1 --train-goal-bar-max 2 --start-bar-max 1 \
+  --eval-goal-bar 2 --scene full035 --num-envs 128 --exp-name brach_contact_2bar \
+  --buffer-gb 1.0 --xla-mem-fraction 0.6
+```
+
+判读仍按 §9.61/9.62 的行为指标：`bar_L/bar_R`、`max_bar`、`cov_dual_runmax_improve`、`fell`、
+`len`，外加**新的** `cov_hover_*`（近而无力 = 悬停步数）与 `cov_load_*`（标定是否健康）。
+`success`/`dist` 与既有变体不可横向比（goal 维数不同）。
+
+**读数注意（和 `episode_dist` 同一条规矩）**：`eval/episode_cov_load_*` 是**每 episode 的求和**，
+要除以 `eval/avg_episode_length` 才是平均 N·m；`cov_contact_*_on_steps` 同样求和，除以长度是"承力步占比"。
+一个方便的恒等式：`cov_load_L / cov_contact_L_on_steps` = **该手承力期间的平均载荷**（两者同为求和）。
+（未训练策略的 smoke 实测：`cov_load_L ≈ 233`、`avg_episode_length ≈ 17` ⇒ 均值 ~14 N·m，
+因为随机动作第 1 步就把抓握协同压到 `c≈0.5`、机器人几帧内脱手——这是**预期**的，不是特征坏了。）
+
+#### 9.72.7 端到端验证（CPU，全部通过）
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 形状/自洽 | `check_args` / `check_metrics` / `check_variants`（19 变体）| 全 OK |
+| **goal 读数一致性** | `check_variants --deep`（19 变体各跑 3 步真实 `step`）| 19/19 `dist` 逐位一致（抓到并修掉 §9.72.5(b)）|
+| **接触特征** | `check_contact_sense`（4 臂 × 18 断言，两个变体 × 20/30 步）| 4/4 组合全过 |
+| θ 可行性带 | `--contact-theta` 扫 6 个值 | `[0.25, 0.45]` 全过，带外如预期失败 |
+| 训练接线 | `train.py --smoke --goal-variant {support_dual_contact,dual_hcontact}` | 两变体 `goal=13/12、state=146/148、obs=159/160`，eval CSV 里 10 个 `cov_contact/near/hover/load` 列都在，**指标全有限** |
+| 上游 patch | `tools/make_patch.sh --check` | byte-identical（新增 evaluator 白名单 10 项）|
+
+**smoke 的 NaN 不是这次改动引入的**：同一 smoke 用既有变体 `support_dual` 也走到同一个
+`[abort] training diverged to NaN`（§9.34.5 已记录的 smoke 配置问题：4 envs / batch 100 / replay 50）。
+判据是**环境指标是否有限**——三个 run 的 `episode_dist`/`cov_*` 全部有限，NaN 只出现在 `critic_loss`。

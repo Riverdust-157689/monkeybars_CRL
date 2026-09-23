@@ -164,6 +164,18 @@ class ActorEvaluator:
                         "cov_park_runmax_improve",
                         "cov_park_hold_sum",
                         "cov_single_on_steps",
+                        # 9.72: real-contact readouts (finger load from
+                        # data.qfrc_constraint) -- see src/check_contact_sense.py
+                        "cov_contact_L_on_steps",
+                        "cov_contact_R_on_steps",
+                        "cov_contact_both_on_steps",
+                        "cov_contact_runmax_improve",
+                        "cov_near_L_on_steps",
+                        "cov_near_R_on_steps",
+                        "cov_hover_L_on_steps",
+                        "cov_hover_R_on_steps",
+                        "cov_load_L",
+                        "cov_load_R",
                         # M4: how many bars the episode advanced (sustained grips)
                         "advance_max",
                     ]

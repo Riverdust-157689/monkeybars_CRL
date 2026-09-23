@@ -115,51 +115,35 @@ def main() -> int:
     # must match training, otherwise the actor's input width is wrong
     variant = cfg.get("goal_variant") or ("position" if cfg.get("goal_position_only") else "full")
     window = cfg.get("action_window", "reach")
+    contact = {k: float(cfg[k]) for k in ("contact_f0", "contact_theta", "contact_ema")
+               if k in cfg}
     env = create_brachiation(impl=impl, scene=scene, n_frames=n_frames,
                              goal_bar=goal_bar, naconmax=4096, njmax=512,
-                             goal_variant=variant, action_window=window)
+                             goal_variant=variant, action_window=window, **contact)
     # upstream CRL never forwards use_ln to the Actor -> instantiate it the same way
     actor = Actor(action_size=action_size, network_width=h_dim, network_depth=n_hidden,
                   skip_connections=skip, use_relu=False)
 
     E, T = args.episodes, args.steps
+    ctxt = (f"contact_thresh={env.contact_thresh:.1f} N.m (f0={env.contact_f0:g}, "
+            f"theta={env.contact_theta:g}, ema={env.contact_ema:g}) "
+            if "contact" in variant else "")
     print(f"[render] ckpt={args.ckpt} steps={ckpt_steps} git={cfg.get('git_commit', '?')} "
           f"scene={scene} impl={impl} "
           f"W={h_dim} D={n_hidden} skip={skip} n_frames={n_frames} "
           f"goal_bar={goal_bar} goal_variant={variant} action_window={window} "
-          f"obs={env.observation_size} episodes={E} steps={T} "
+          f"obs={env.observation_size} episodes={E} steps={T} {ctxt}"
           f"actor={'stochastic' if args.stochastic else 'deterministic (eval mode)'}",
           flush=True)
 
     reset = jax.jit(jax.vmap(env.reset))
     step = jax.jit(jax.vmap(env.step))
     grasp = jax.jit(jax.vmap(env._grasp))
-    # Goal variants that use the sustained-contact entry ("support_hold") need the
-    # streak from info; `_hold_feature` keeps the single source of truth for the map.
-    variant_cfg = str(cfg.get("goal_variant", ""))
-    uses_park = variant_cfg == "park"
-    uses_hold = "hold" in variant_cfg and not uses_park
-    uses_dual = variant_cfg in ("support_dual", "dual_nomax")
-    uses_cnext = variant_cfg in ("dual_cnext", "dual_hnext", "dual6c", "dual6d",
-                                 "dual_hnext_max", "dual_hnext_dual")
-    uses_hpair = variant_cfg in ("dual_hnext", "dual6c", "dual6d",
-                                 "dual_hnext_max", "dual_hnext_dual")
-    uses_hpair = variant_cfg == "dual_hnext"
-    if uses_cnext:
-        if uses_hpair:
-            achieved = jax.jit(jax.vmap(lambda ps, h, hd, kg, hp: env._achieved_goal(
-                ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd), 0.0, kg,
-                env._hold_feature(hp))))
-        else:
-            achieved = jax.jit(jax.vmap(lambda ps, h, hd, kg: env._achieved_goal(
-                ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd), 0.0, kg)))
-    elif uses_dual:
-        achieved = jax.jit(jax.vmap(lambda ps, h, hd: env._achieved_goal(
-            ps, env._hold_feature(h), 0.0, 0.0, env._hold_feature(hd))))
-    elif uses_hold:
-        achieved = jax.jit(jax.vmap(lambda ps, h: env._achieved_goal(ps, env._hold_feature(h))))
-    else:
-        achieved = jax.jit(jax.vmap(env._achieved_goal))
+    # ONE entry point for the goal readout, whatever the variant: the old code
+    # hand-assembled `_achieved_goal`'s per-variant arguments here and got them
+    # wrong twice (a variant whose history argument was dropped silently reports a
+    # goal distance computed with that dim = 0).  See `_achieved_goal_info`.
+    achieved = jax.jit(jax.vmap(env._achieved_goal_info))
     state = reset(jax.random.split(jax.random.PRNGKey(args.seed), E))
 
     def act(params, obs, key):
@@ -181,30 +165,12 @@ def main() -> int:
         d, w = (np.asarray(x) for x in grasp(s.pipeline_state))
         dmin = d.min(axis=-1)
         bar = np.where(dmin < 0.05, w.argmax(axis=-1), -1)
-        # measure the goal distance ourselves: reset() seeds metrics with zeros
-        if uses_park:
-            diff = (np.asarray(achieved(s.pipeline_state, 0.0, 0.0, 0.0, 0.0,
-                                        env._hold_feature(s.info["park_streak"])))
-                    - np.asarray(s.info["goal"]))
-        elif uses_cnext:
-            if uses_hpair:
-                diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
-                                            s.info["dual_streak"], s.info["k_goal"],
-                                            s.info["hpair_streak"]))
-                        - np.asarray(s.info["goal"]))
-            else:
-                diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
-                                            s.info["dual_streak"], s.info["k_goal"]))
-                        - np.asarray(s.info["goal"]))
-        elif uses_dual:
-            diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"],
-                                        s.info["dual_streak"]))
-                    - np.asarray(s.info["goal"]))
-        elif uses_hold:
-            diff = (np.asarray(achieved(s.pipeline_state, s.info["hold_streak"]))
-                    - np.asarray(s.info["goal"]))
-        else:
-            diff = np.asarray(achieved(s.pipeline_state)) - np.asarray(s.info["goal"])
+        # measure the goal distance ourselves: reset() seeds metrics with zeros.
+        # `_achieved_goal_info` reads every history-dependent arg (hold, h_dual,
+        # h_park, k_goal, hnext, contact) out of `state.info` -- vmap over a dict
+        # pytree works, and it cannot drift from what `step` computes.
+        diff = (np.asarray(achieved(s.pipeline_state, s.info))
+                - np.asarray(s.info["goal"]))
         rec["dist"][i] = np.linalg.norm(diff, axis=-1)
         rec["dist_pos"][i] = np.linalg.norm(diff[:, :8], axis=-1)   # position-only view (drop c_L,c_R)
         rec["c_L"][i] = np.exp(-(dmin[:, 0] / 0.04) ** 2)

@@ -13,7 +13,16 @@ Checks, for every entry of ``GOAL_VARIANTS``:
     ``n_bars`` rows otherwise);
   * ``observation_size == state_dim + len(goal_indices)``.
 
-Usage:  .venv-warp/bin/python src/check_variants.py [--scene full035]
+With ``--deep`` it additionally runs 3 real ``step``s per variant and asserts that
+``_achieved_goal_info(state.pipeline_state, state.info)`` — the SINGLE entry point
+``render_policy.py`` now uses — reproduces ``state.metrics["dist"]`` exactly.  That
+is the invariant that broke silently before: the render side hand-assembled the
+per-variant history arguments, and one variant's `hnext` was dropped, so the
+rendered goal distance was computed from a different state than the one training
+used.  (Cheap enough to opt into before a long run; skipped by default because it
+compiles a `step` per variant.)
+
+Usage:  .venv-warp/bin/python src/check_variants.py [--scene full035] [--deep]
 """
 from __future__ import annotations
 
@@ -32,8 +41,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", default="full035",
                     choices=["full", "full035", "mesh", "allprim"])
+    ap.add_argument("--deep", action="store_true",
+                    help="also run 3 real steps per variant and check that "
+                         "_achieved_goal_info reproduces metrics['dist']")
     args = ap.parse_args()
 
+    import jax
     import jax.numpy as jnp
 
     from envs.brachiation import GOAL_VARIANTS, Brachiation
@@ -60,6 +73,22 @@ def main() -> int:
                 v, st.shape[0], len(env.goal_indices), env.observation_size, gs.shape[0],
                 "OK" if ok else "MISMATCH"))
             bad += 0 if ok else 1
+            if ok and args.deep:
+                # the render/metrics agreement invariant (see the module docstring)
+                state = env.reset(jax.random.PRNGKey(0))
+                act = jnp.zeros(env.action_size)
+                for _ in range(3):
+                    state = env.step(state, act)
+                ag = np.asarray(env._achieved_goal_info(state.pipeline_state, state.info))
+                d_ref = float(state.metrics["dist"])
+                d_got = float(np.linalg.norm(ag - np.asarray(state.info["goal"])))
+                fine = ag.shape == (len(env.goal_indices),) and np.isfinite(ag).all()
+                agree = abs(d_ref - d_got) < 1e-4
+                print("%-14s %6s %6s %6s %6s  deep %s (dist %.6f vs %.6f)" % (
+                    v, "-", "-", "-", "-",
+                    "OK" if (fine and agree) else "MISMATCH",
+                    d_ref, d_got))
+                bad += 0 if (fine and agree) else 1
         except Exception as exc:                      # noqa: BLE001
             print("%-14s %6s %6s %6s %6s  FAIL %s: %s" % (
                 v, "-", "-", "-", "-", type(exc).__name__, str(exc)[:60]))

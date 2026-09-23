@@ -82,6 +82,51 @@ TAU_GRASP = 0.05        # m, softmax temperature for "which bar"
 TAU_CONTACT = 0.04      # m, soft contact indicator width
 GRASP_THRESH = 0.05     # m, hand-to-bar distance counted as a grasp
 
+# ---- real contact sensing (9.72) ------------------------------------------- #
+# Every "is a hand on the bar" test above is a *geometric proxy* (distance from
+# the calibrated grasp seat).  That is why a hand can hover 3 cm under the bar
+# with the fingers wide open and still score like a grasp -- the exact pathology
+# seen on goal=B1 (left hand parked near B1, never closing) and in the
+# dual_hnext late regression (right hand 0.000 m from B1, grasp closure 0.12).
+#
+# The simulator does expose a real contact signal: ``data.qfrc_constraint`` (nv,)
+# is the joint-space constraint load, i.e. J_contact^T @ efc_force, so summing
+# |.| over one hand's 7 finger DOFs is the load that hand carries THROUGH ITS
+# FINGERS.  This is also the cheapest honest sensor available here:
+#   * the Warp backend exposes no ``data.contact`` / ``data.efc_force``;
+#   * MJX implements only ``sensor_pos/vel/acc`` -- ``<touch>`` is not supported;
+#   * ``qfrc_constraint`` IS in both ``jax`` and ``warp`` mjx.Data (shape (nv,)).
+# Measured on the `hang` keyframe (d035, two-handed hang, fingers closed):
+#   Sum|qfrc_constraint| over finger DOFs = 40.1 (L) / 41.0 (R) N m,
+#   while the global max is 337.5 N = m*g (the bars carry the whole robot).
+# With the fingers OPEN and the robot released: 0.00 / 0.00 (global max 0.10).
+# Consequences for the design:
+#   * a *distance* threshold is not a contact proxy at all -- binned by distance
+#     to the nearest bar, the finger load is a median 62 N m even at 3.5-6 cm
+#     (the fingers are loaded by the bar they are actually hooked on), so a
+#     "hold" feature must threshold the FORCE, not the distance;
+#   * the force alone cannot say WHICH bar a hand is loaded on, so the feature
+#     below is the AND of "this hand is inside the goal bar's window" and "this
+#     hand is carrying load" -- that is what removes the B0 loophole.
+CONTACT_F0 = 40.0       # N m, reference load = one hand of a validated hang
+                        # (static keyframe; through the control loop a real hang
+                        # sits at 48-68 and a one-handed swinging hang bottoms at
+                        # 37.7 -- measured, see src/check_contact_sense.py)
+CONTACT_THETA = 0.3     # "loaded" cutoff as a fraction of F0 -> 12.0 N m.
+                        # Measured band (src/check_contact_sense.py, sweep of
+                        # 0.20/0.25/0.30/0.40/0.45/0.50 with 2x margins): the 18
+                        # controls hold for theta in [0.25, 0.45] -> threshold
+                        # 10-18 N m.  Below it a hand only BRUSHING the bar with
+                        # open fingers (peak 9.5) counts as a grip; above it a
+                        # one-handed swinging hang (min 37.7) loses its 2x margin.
+                        # 0.3 is 1.3x above the brush and 3.1x below the swing,
+                        # i.e. deliberately conservative on the "never call a
+                        # hover a grip" side.
+CONTACT_EMA = 5.0       # control steps, EMA time constant applied BEFORE the
+                        # threshold (alpha = 1/CONTACT_EMA): single-step contact
+                        # impulses (a graze, a soft-body bounce) must not latch a
+                        # 25-step streak.
+
 FALL_DEPTH = 0.8        # m below the bar plane -> terminated
 
 
@@ -102,6 +147,9 @@ class FeatureLayout(NamedTuple):
     cnext: slice           # [c_L,gk, c_R,gk]: per-hand contact with the GOAL bar
     hnext: slice           # [h_L,gk, h_R,gk]: per-hand SUSTAINED contact with it
     dnext: slice           # [d_L,gk, d_R,gk]: per-hand DISTANCE to it (metres)
+    contact: slice         # [f_L,gk, f_R,gk]: per-hand SUSTAINED contact with the
+                           # goal bar measured from the REAL contact load
+                           # (qfrc_constraint), not from distance (see CONTACT_F0)
     park: slice            # how long the torso has been parked under some bar
     cross: slice           # [p_R - p_B1 (3), c_{R,B1}, c_{L,B0}]  (only variant "cross")
     prev_action: slice
@@ -113,6 +161,7 @@ class FeatureLayout(NamedTuple):
 
 GOAL_VARIANTS = ("full", "support", "support_hold", "support_dual", "dual_nomax",
                  "dual_cnext", "dual_hnext", "dual_hnext_max", "dual_hnext_dual",
+                 "dual_hcontact", "support_dual_contact",
                  "dual6c", "dual6d", "park",
                  "position", "cross", "cross3", "hold2", "advance")
 
@@ -155,7 +204,10 @@ SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
                   # 9.66: these两个 = dual_hnext + 恰好一维（角色 2 / 角色 3）。
                   # 进 SUPPORT_FAMILY 只是为了拿到 max(c) 的 state 槽（dua_hnext_max
                   # 需要它作为 goal 项；dual_hnext_dual 只把它当可观测量）。
-                  "dual_hnext_max", "dual_hnext_dual")
+                  "dual_hnext_max", "dual_hnext_dual",
+                  # 9.72: support_dual + 两个"真实接触"维（max(c) 仍作为角色 2）,
+                  # 以及 dual_hnext 的 hnext(2) -> contact(2) 单变量替换版
+                  "support_dual_contact", "dual_hcontact")
 # "dual6c"/"dual6d" are deliberately NOT in SUPPORT_FAMILY: their goal drops the
 # max(c)/h_any/h_dual block entirely (x,z + goal-bar per-hand terms only).
 # "support_hold" adds the *any-hand* sustained-contact entry h_any; "support_dual"
@@ -164,7 +216,11 @@ SUPPORT_FAMILY = ("support", "support_hold", "support_dual", "dual_nomax",
 # space an explicit three-layer structure -- flight (0,0) -> single support (1,0)
 # -> dual support (1,1) -- without constraining how the policy moves between them.
 HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
-               "dual_hnext")
+               "dual_hnext", "support_dual_contact",
+               # 9.72: dual_hcontact carries h_any/h_dual as OBSERVABLES only, so
+               # that its state is dual_hnext's state with hnext(2) -> contact(2)
+               # (a clean single-variable probe, not a state-size change too)
+               "dual_hcontact")
 # "dual_nomax" = run #13's support_dual minus the instantaneous `max(c_L,c_R)`
 # entry (goal = [x, z, p_L(3), p_R(3), h_any, h_dual], 10-D).  The rationale above
 # was FALSIFIED by run #18 + CPU measurement (docs/M2_JaxGCRL接入记录.md 9.50):
@@ -172,14 +228,14 @@ HOLD_FAMILY = ("support_hold", "support_dual", "dual_nomax", "dual_cnext",
 # goal of 1.0, the trained policy drives it to 0.96-0.98, and deleting it makes
 # training collapse (fell 100%, advance/succ stuck at 0).  Kept for the record.
 DUAL_FAMILY = ("support_dual", "dual_nomax", "dual_cnext", "dual_hnext",
-               "dual_hnext_dual")
+               "dual_hnext_dual", "support_dual_contact", "dual_hcontact")
 # "dual_cnext" (9.51) keeps a high-gain instantaneous contact term -- the measured
 # load-bearing part -- but makes it PER-HAND and aimed at the INSTRUCTION GOAL BAR:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_any, h_dual]      (12-D)
 # instead of max(c_L,c_R) = "at least one hand on SOME bar", which the start-bar
 # hang already satisfies and a single hand can satisfy alone.
 CNEXT_FAMILY = ("dual_cnext", "dual_hnext", "dual6c",
-                "dual_hnext_max", "dual_hnext_dual")
+                "dual_hnext_max", "dual_hnext_dual", "dual_hcontact")
 # "dual_hnext" (9.52) = dual_cnext with the two bar-AGNOSTIC persistence dims
 # h_any/h_dual replaced by per-hand, goal-bar-specific ones:
 #   g = [x, z, p_L(3), p_R(3), c_L,gk, c_R,gk, h_L,gk, h_R,gk]      (12-D)
@@ -210,6 +266,31 @@ HDMAX_FAMILY = ("dual_hnext_dual",)
 # saturating soft contact" -- see _advance_features), and c gives the grip magnitude
 # that run #18 showed to be load-bearing near the bar.
 DNEXT_FAMILY = ("dual6d",)
+# ---- 9.72: the "real contact" family --------------------------------------- #
+# Both variants carry two extra state/goal dims, f_{h,gk} for h = L, R:
+#
+#   f_{h,gk} = 1 - exp(-s_h / HOLD_TAU),
+#   s_h      = consecutive steps with  (d[h, gk] < GRASP_THRESH) AND (F_h > thresh)
+#
+# where F_h is the EMA (alpha = 1/CONTACT_EMA) of Sum|qfrc_constraint| over hand
+# h's 7 finger DOFs and thresh = CONTACT_F0 * CONTACT_THETA.  The AND is what
+# makes it honest: the force says "this hand really is loaded", the distance gate
+# says "and it is loaded on the INSTRUCTED bar" (a hand clamped on the start bar
+# also carries 40 N m, so the force alone has the B0 loophole).
+#
+# The two variants answer the two open failures with ONE change each:
+#   dual_hcontact        = dual_hnext with h_L,gk/h_R,gk -> f_L,gk/f_R,gk
+#                          (same 12-D goal, same state, single-variable probe for
+#                          "the trailing hand reaches B1 at 0.000 m but never
+#                          closes" -- hnext's distance criterion is satisfied by
+#                          hovering, f is not);
+#   support_dual_contact = support_dual + the same two dims (11 -> 13 dims), i.e.
+#                          the two-bar-curriculum recipe with "load the instructed
+#                          bar per hand" added on top of max(c)/h_any/h_dual.
+# h_any/h_dual themselves are NOT re-encoded: max(f_L,f_R) and min(f_L,f_R) are
+# exactly the bar-agnostic "any hand / both hands loaded on the goal bar", so the
+# two bar-specific dims already contain them (with the extra bar identity).
+CONTACT_FAMILY = ("dual_hcontact", "support_dual_contact")
 # `hold = 1 - exp(-streak / HOLD_TAU)` where `streak` is the number of consecutive
 # steps with at least one hand inside the grasp window of some bar (< GRASP_THRESH,
 # the same criterion as bar_L/bar_R/max_bar -- NOT max(c) > 0.5, which would call a
@@ -290,6 +371,11 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     cnext = nxt(2) if goal_variant in CNEXT_FAMILY else slice(i, i)
     hnext = nxt(2) if goal_variant in HPAIR_FAMILY else slice(i, i)
     dnext = nxt(2) if goal_variant in DNEXT_FAMILY else slice(i, i)
+    # per-hand sustained contact with the GOAL bar measured from the REAL contact
+    # load (9.72).  Only allocated for the contact family, so observation sizes --
+    # and therefore previously saved checkpoints -- are untouched for every other
+    # variant.
+    contact = nxt(2) if goal_variant in CONTACT_FAMILY else slice(i, i)
     # "park": how long the TORSO has been inside some bar's hang box (history)
     park = nxt(1) if goal_variant == "park" else slice(i, i)
     # cross-family extras: [rel_pR(3), d_RB1, c_RB1, c_LB0, c_LB1, c_RB0]
@@ -301,7 +387,18 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
     kref = nxt(1) if goal_variant == "advance" else slice(i, i)
     goal_indices = (root_pos.start, root_pos.start + 2,
                     *(range(hand_pos.start, hand_pos.start + 6)))
-    if goal_variant in HMAX_FAMILY:
+    if goal_variant == "dual_hcontact":
+        # [x, z, p(6), c_L,gk, c_R,gk, f_L,gk, f_R,gk]  (12)
+        # dual_hnext's goal with the two SUSTAINED dims re-measured from contact
+        # load instead of distance (single-variable swap, see CONTACT_FAMILY).
+        goal_indices = goal_indices + (cnext.start, cnext.start + 1,
+                                       contact.start, contact.start + 1)
+    elif goal_variant == "support_dual_contact":
+        # [x, z, p(6), max(c), h_any, h_dual, f_L,gk, f_R,gk]  (13)
+        goal_indices = goal_indices + (grasp_support.start, hold.start,
+                                       hold_dual.start,
+                                       contact.start, contact.start + 1)
+    elif goal_variant in HMAX_FAMILY:
         # [x, z, p(6), max(c), c_L,gk, c_R,gk, h_L,gk, h_R,gk]   (13)
         goal_indices = goal_indices + (grasp_support.start,
                                        cnext.start, cnext.start + 1,
@@ -352,8 +449,8 @@ def default_layout(njoints: int, goal_variant: str = "full") -> FeatureLayout:
         goal_indices = tuple(advance.start + k for k in range(6))
     return FeatureLayout(root_pos, root_quat, root_linvel, root_angvel, joint_pos,
                          joint_vel, hand_pos, grasp_dist, grasp_soft, grasp_ind,
-                         grasp_support, hold, hold_dual, cnext, hnext, dnext, park,
-                         cross, prev_action,
+                         grasp_support, hold, hold_dual, cnext, hnext, dnext, contact,
+                         park, cross, prev_action,
                          advance, kref, i, tuple(goal_indices))
 
 
@@ -378,6 +475,9 @@ class Brachiation(Env):
         goal_variant: str = "full",          # "full" | "support" | "position" (see default_layout)
         action_window: str = "reach",        # "m1" (old, cannot express a reach) | "reach"
         goal_reach_thresh: float = 0.35,
+        contact_f0: float = CONTACT_F0,       # 9.72: reference finger load (N m)
+        contact_theta: float = CONTACT_THETA, # 9.72: loaded cutoff / F0
+        contact_ema: float = CONTACT_EMA,     # 9.72: EMA steps before thresholding
         dwell_steps: int = 25,               # 0.5 s at 50 Hz
         start_bar_max: int = 0,              # M4: reset on bar U{0..start_bar_max}
         goal_ahead: bool = False,            # M4: sample the goal bar AFTER the start bar
@@ -441,6 +541,9 @@ class Brachiation(Env):
              # 9.66: dual_hnext 各加一维（10 = max(c)，20 = h_dual）
              "dual_hnext_max": _pos + [10, 28, 29, 30, 31],
              "dual_hnext_dual": _pos + [28, 29, 30, 31, 20],
+             # 9.72: real-contact sustained dims (superset 34, 35 = f_L,gk, f_R,gk)
+             "dual_hcontact": _pos + [28, 29, 34, 35],
+             "support_dual_contact": _pos + [10, 19, 20, 34, 35],
              "dual6c": [0, 1, 28, 29, 30, 31],
              "dual6d": [0, 1, 32, 33, 30, 31],
              # M5 coarse goal: absolute torso (x,z) + the parked streak (index 27)
@@ -455,6 +558,19 @@ class Brachiation(Env):
             dtype=jnp.int32)
         self.goal_size = int(len(self.goal_indices))
         self.goal_reach_thresh = goal_reach_thresh
+        # ---- 9.72 contact-load thresholds -----------------------------------
+        # Validated positively AND negatively (src/check_contact_sense.py): a
+        # settled keyframe hang must read "loaded" on both hands for >=95% of the
+        # steps, and a released robot (fingers open) for <=1%.
+        self.contact_f0 = float(contact_f0)
+        self.contact_theta = float(contact_theta)
+        self.contact_ema = float(contact_ema)
+        if self.contact_f0 <= 0 or self.contact_theta <= 0:
+            raise ValueError(f"contact_f0/contact_theta must be > 0, got "
+                             f"{self.contact_f0}/{self.contact_theta}")
+        if self.contact_ema < 1.0:
+            raise ValueError(f"contact_ema must be >= 1 step, got {self.contact_ema}")
+        self.contact_thresh = self.contact_f0 * self.contact_theta
         self.dwell_steps = int(dwell_steps)
         self.n_bars = int(n_bars)
         self._reset_cfg = (reset_noise_root, reset_noise_arm, reset_noise_leg, reset_noise_vel)
@@ -469,6 +585,14 @@ class Brachiation(Env):
         self.act_scale = jnp.array(ACTION_WINDOWS[action_window], dtype=jnp.float32)
         self.hand_act = {s: jnp.array([aid(f"{s}_hand_{j}_joint") for j in FINGER_JOINTS], dtype=jnp.int32)
                          for s in ("left", "right")}
+        # DOF addresses (into qvel / qfrc_constraint, i.e. nv) of the same finger
+        # joints -- the contact-load readout of 9.72.  NB: `jnt_dofadr`, NOT the
+        # actuator index: nv = 49 while there are 43 actuators (the 6-DoF free
+        # joint occupies 0..5), so the two differ by 6 for every joint.
+        self.finger_dof = {
+            s: jnp.array([int(m.jnt_dofadr[jid(f"{s}_hand_{j}_joint")])
+                          for j in FINGER_JOINTS], dtype=jnp.int32)
+            for s in ("left", "right")}
         self.wrist_body = {s: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"{s}_wrist_roll_link")
                            for s in ("left", "right")}
         # --- keyframe --------------------------------------------------------
@@ -519,7 +643,8 @@ class Brachiation(Env):
                          + [0.0,                               # park (settled = 1)
                             0.0, 0.0,                          # c_L,next / c_R,next = 1
                             0.0, 0.0,                          # h_L,next / h_R,next = 1
-                            0.0, 0.0],                         # d_L,next / d_R,next = 0
+                            0.0, 0.0,                          # d_L,next / d_R,next = 0
+                            0.0, 0.0],                         # f_L,next / f_R,next = 1
                          dtype=np.float32)
         keep = np.asarray(self._goal_full_idx)
         if self.goal_variant in CROSS_FAMILY:
@@ -618,6 +743,17 @@ class Brachiation(Env):
                      + (p[:, None, 2] - self.bar_z) ** 2)
         return d, jax.nn.softmax(-d / TAU_GRASP, axis=-1)
 
+    def _contact_load(self, data) -> jnp.ndarray:
+        """(2,) REAL per-hand contact load: Sum|qfrc_constraint| over finger DOFs.
+
+        This is the only true contact signal MJX exposes (no ``data.contact`` in
+        the Warp backend, no ``<touch>`` sensor in MJX -- see the CONTACT_F0 note).
+        It says "this hand is carrying load through its fingers"; it does NOT say
+        which bar, which is why every consumer ANDs it with a distance gate.
+        """
+        return jnp.stack([jnp.abs(data.qfrc_constraint[self.finger_dof[s]]).sum()
+                          for s in ("left", "right")])
+
     # ---- M3.1 coverage / extrema metrics ---------------------------------- #
     # The evaluator (brax EvalWrapper) SUMS per-step metrics over an episode, so
     # every number here is built so that its episode SUM is interpretable:
@@ -629,7 +765,8 @@ class Brachiation(Env):
     # running trackers live in info[] and start at these values
     _D0 = 2.0      # initial "min distance to B1" bound (nothing is 2 m away)
 
-    def _coverage(self, data, info, hold_dual=0.0, h_park=0.0):
+    def _coverage(self, data, info, hold_dual=0.0, h_park=0.0,
+                  contact_now=None, near_goal=None, load=None):
         """Return (metrics_update, info_update) for the coverage diagnostics.
 
         `hold_dual` is passed in because it is computed in ``step`` (it is history,
@@ -678,6 +815,20 @@ class Brachiation(Env):
         run_b1, b1_imp, b1_max = streak(hold_b1, "cov_b1_run")
         run_xf, xf_imp, xf_max = streak(handed, "cov_xfer_run")
         run_air, air_imp, air_max = streak(air, "cov_air_run")
+        # ---- 9.72 real-contact controls -------------------------------------
+        # `near_goal` is the distance-only criterion the hnext family uses;
+        # `contact_now` is the force-gated one.  Their difference IS the
+        # "hovering at the instructed bar with the fingers open" measure, which is
+        # the pathology this whole feature exists to remove -- so track all three
+        # explicitly (positive control: keyframe hang; negative: released robot).
+        if contact_now is None:
+            contact_now = jnp.zeros((2,))
+        if near_goal is None:
+            near_goal = jnp.zeros((2,))
+        if load is None:
+            load = jnp.zeros((2,))
+        hover = (near_goal * (1.0 - contact_now))
+        run_ct, ct_imp, ct_max = streak(contact_now[0] * contact_now[1], "cov_contact_run")
 
         m = {
             # true episode minimum (sum = D0 - min) and the first-crossing P(min<r)
@@ -710,6 +861,21 @@ class Brachiation(Env):
             "cov_xfer_runmax_improve": xf_imp,
             # how long it flies with NO hand on any bar (the "dive"); run #10 = ~11
             "cov_air_runmax_improve": air_imp,
+            # 9.72: real-contact readouts, per hand and combined.  Acceptance
+            # controls live in src/check_contact_sense.py.
+            "cov_contact_L_on_steps": contact_now[0],
+            "cov_contact_R_on_steps": contact_now[1],
+            "cov_contact_both_on_steps": contact_now[0] * contact_now[1],
+            "cov_contact_runmax_improve": ct_imp,
+            # the distance-only criterion (== what hnext thresholds) and the
+            # "near but NOT loaded" gap between them
+            "cov_near_L_on_steps": near_goal[0],
+            "cov_near_R_on_steps": near_goal[1],
+            "cov_hover_L_on_steps": hover[0],
+            "cov_hover_R_on_steps": hover[1],
+            # raw EMA load, so the threshold can be re-read off any run
+            "cov_load_L": load[0],
+            "cov_load_R": load[1],
         }
         for r in self.COVER_RADII:
             tag = f"{int(r * 100):03d}"
@@ -724,6 +890,7 @@ class Brachiation(Env):
                         cov_b1_run=run_b1, cov_b1_runmax=b1_max,
                         cov_xfer_run=run_xf, cov_xfer_runmax=xf_max,
                         cov_air_run=run_air, cov_air_runmax=air_max,
+                        cov_contact_run=run_ct, cov_contact_runmax=ct_max,
                         cov_park_run=_run_park, cov_park_runmax=_max_park)
         # ⚠️ Return ONLY the coverage keys.  This function used to return a full
         # `dict(info)`, and `step` applied it as the LAST update -- which silently
@@ -741,7 +908,13 @@ class Brachiation(Env):
                 "cov_dual_hold_sum", "cov_single_on_steps",
                 "cov_park_on_steps", "cov_park_runmax_improve", "cov_park_hold_sum",
                 "cov_b1_runmax_improve", "cov_xfer_runmax_improve",
-                "cov_air_runmax_improve"]
+                "cov_air_runmax_improve",
+                # 9.72 real-contact metrics (see _coverage)
+                "cov_contact_L_on_steps", "cov_contact_R_on_steps",
+                "cov_contact_both_on_steps", "cov_contact_runmax_improve",
+                "cov_near_L_on_steps", "cov_near_R_on_steps",
+                "cov_hover_L_on_steps", "cov_hover_R_on_steps",
+                "cov_load_L", "cov_load_R"]
         keys += [f"cov_cross_b1_{int(r * 100):03d}" for r in self.COVER_RADII]
         return {k: jnp.zeros(()) for k in keys}
 
@@ -753,10 +926,19 @@ class Brachiation(Env):
                 "cov_xfer_run": jnp.zeros(()), "cov_xfer_runmax": jnp.zeros(()),
                 "cov_air_run": jnp.zeros(()), "cov_air_runmax": jnp.zeros(()),
                 "cov_dual_run": jnp.zeros(()), "cov_dual_runmax": jnp.zeros(()),
+                "cov_contact_run": jnp.zeros(()), "cov_contact_runmax": jnp.zeros(()),
                 "cov_park_run": jnp.zeros(()), "cov_park_runmax": jnp.zeros(()),
                 # not a coverage metric, but this is where `reset` zero-initialises
                 # the state-carried counters (used by the support_hold goal entry)
-                "hold_streak": jnp.zeros(())}
+                "hold_streak": jnp.zeros(()),
+                # the `hold` VALUE step actually used (it is the NEXT bar's streak
+                # for "advance" and the any-bar one everywhere else -- recording the
+                # resolved value here is what makes `_achieved_goal_info` exact for
+                # every variant instead of re-deriving the choice and drifting)
+                "hold_feature": jnp.zeros(()),
+                # 9.72 contact-streak state (2,) + the EMA of the raw finger load
+                "contact_streak": jnp.zeros((2,)),
+                "contact_ema": jnp.zeros((2,))}
 
     def _state_features(self, data, prev_action: jnp.ndarray,
                         hold: jnp.ndarray = 0.0, kref: jnp.ndarray = 0.0,
@@ -764,7 +946,8 @@ class Brachiation(Env):
                         hold_dual: jnp.ndarray = 0.0,
                         park: jnp.ndarray = 0.0,
                         k_goal: jnp.ndarray = 0.0,
-                        hnext: jnp.ndarray = 0.0) -> jnp.ndarray:
+                        hnext: jnp.ndarray = 0.0,
+                        contact: jnp.ndarray = 0.0) -> jnp.ndarray:
         d, w = self._grasp(data)
         dmin = d.min(axis=-1)
         c = jnp.exp(-(dmin / TAU_CONTACT) ** 2)          # soft "grasping" indicator
@@ -786,6 +969,11 @@ class Brachiation(Env):
             parts.append(jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,)))
         if self.goal_variant in DNEXT_FAMILY:
             parts.append(self._dnext(d, k_goal))
+        if self.goal_variant in CONTACT_FAMILY:
+            # `contact` is history (the streak of info["contact_streak"] mapped
+            # through _hold_feature in `step`), exactly like `hnext`: it is a
+            # function of the REAL finger load, not of the instantaneous state.
+            parts.append(jnp.broadcast_to(jnp.asarray(contact, jnp.float32), (2,)))
         if self.goal_variant == "park":
             # only the parked streak is added: x_torso and z_torso are already
             # features 0 and 2 of the base block
@@ -855,7 +1043,11 @@ class Brachiation(Env):
                                [1.0, 1.0],
                                # dual6d: the grasp seats sit ON the goal bar at the
                                # canonical hang, so the per-hand distance is 0
-                               [0.0, 0.0]]).astype(np.float32)
+                               [0.0, 0.0],
+                               # 9.72 contact family: at the canonical hang both
+                               # hands are clamped on the bar and carry 40 N m, so
+                               # the sustained-contact-strength entry is settled at 1
+                               [1.0, 1.0]]).astype(np.float32)
 
     def _synergy(self, side: str, c: jnp.ndarray) -> jnp.ndarray:
         """Grasp synergy: closure c in [0,1] -> 7 finger joint targets."""
@@ -876,7 +1068,8 @@ class Brachiation(Env):
                        hold_dual: jnp.ndarray = 0.0,
                        park: jnp.ndarray = 0.0,
                        k_goal: jnp.ndarray = 0.0,
-                       hnext: jnp.ndarray = 0.0) -> jnp.ndarray:
+                       hnext: jnp.ndarray = 0.0,
+                       contact: jnp.ndarray = 0.0) -> jnp.ndarray:
         # `hold` means "the sustained-contact scalar this variant uses":
         #   support_hold -> at least one hand on ANY bar
         #   advance      -> at least one hand on the NEXT bar
@@ -903,8 +1096,30 @@ class Brachiation(Env):
             # (2,) for every variant: the default is a scalar 0.0, and the
             # superset must keep a fixed shape for the non-"dual_hnext" cases
             jnp.broadcast_to(jnp.asarray(hnext, jnp.float32), (2,)),   # 30, 31
-            self._dnext(d, k_goal)])                           # indices 32, 33
+            self._dnext(d, k_goal),                            # indices 32, 33
+            # 9.72: the two real-contact sustained dims (see CONTACT_FAMILY)
+            jnp.broadcast_to(jnp.asarray(contact, jnp.float32), (2,))])  # 34, 35
         return full[self._goal_full_idx]
+
+    def _achieved_goal_info(self, data, info) -> jnp.ndarray:
+        """`_achieved_goal` with every history-dependent argument taken from `info`.
+
+        Single entry point for callers that hold a `State` instead of the raw
+        streak arguments (``render_policy.py``).  It exists because the old
+        render-side dispatch hand-assembled the arguments per variant, and got
+        them wrong twice -- most recently ``uses_hpair`` was silently clobbered to
+        ``variant == "dual_hnext"``, so every hnext-family variant except
+        dual_hnext reported a goal distance computed with h_L,gk = h_R,gk = 0.
+        """
+        return self._achieved_goal(
+            data,
+            info["hold_feature"],
+            info["k_ref"], info["k_ref"] - info["k_start"],
+            self._hold_feature(info["dual_streak"]),
+            self._hold_feature(info["park_streak"]),
+            info["k_goal"],
+            self._hold_feature(info["hpair_streak"]),
+            self._hold_feature(info["contact_streak"]))
 
     def _cnext(self, d: jnp.ndarray, k_goal: jnp.ndarray) -> jnp.ndarray:
         """[c_L,gk, c_R,gk]: per-hand soft contact with the INSTRUCTION GOAL BAR.
@@ -1062,6 +1277,7 @@ class Brachiation(Env):
             [self._state_features(data, jnp.zeros(14), self._hold_feature(0.0), 0.0,
                                   0.0, self._hold_feature(0.0), self._hold_feature(0.0),
                                   jnp.asarray(gk, dtype=jnp.float32),
+                                  self._hold_feature(jnp.zeros((2,))),
                                   self._hold_feature(jnp.zeros((2,)))), goal])
         # JaxGCRL's evaluator hardcodes these five names:
         #   reward, success, success_easy, dist, distance_from_origin
@@ -1151,6 +1367,21 @@ class Brachiation(Env):
                   & (jnp.abs(data.qpos[2] - self.key_qpos[2]) < PARK_RZ))
         park_streak = jnp.where(parked, state.info["park_streak"] + 1.0, 0.0)
         h_park = self._hold_feature(park_streak)
+        # ---- 9.72: the REAL contact signal ---------------------------------
+        # `load` is the EMA of the raw per-hand finger load, and `contact_now` is
+        # the AND of "this hand is inside the GOAL bar's window" (the geometric
+        # gate -- the load alone cannot say which bar) and "this hand is actually
+        # carrying load".  The distance-only counterpart `in_goal` above is what
+        # the hnext family thresholds, so keeping both lets a run report exactly
+        # how much of its "grip" is a real one (cov_hover_* = near AND !loaded).
+        load_raw = self._contact_load(data)
+        alpha = 1.0 / self.contact_ema
+        load = state.info["contact_ema"] + alpha * (load_raw - state.info["contact_ema"])
+        near_goal = (d[:, kg_h] < GRASP_THRESH).astype(jnp.float32)
+        loaded = (load > self.contact_thresh).astype(jnp.float32)
+        contact_now = near_goal * loaded
+        contact_streak = jnp.where(contact_now > 0, state.info["contact_streak"] + 1.0, 0.0)
+        contact = self._hold_feature(contact_streak)
 
         # progress = how many bars this episode has advanced (raw count, so one
         # bar is worth ~1.0 in the goal distance -- the same order as a contact
@@ -1160,12 +1391,12 @@ class Brachiation(Env):
         # policy to keep going.
         progress = k_ref - state.info["k_start"]
         feats = self._state_features(data, action, hold, k_ref, progress, hold_dual,
-                                     h_park, state.info["k_goal"], hpair)
+                                     h_park, state.info["k_goal"], hpair, contact)
         goal = state.info["goal"]
         obs = jnp.concatenate([feats, goal])
 
         achieved = self._achieved_goal(data, hold, k_ref, progress, hold_dual, h_park,
-                                       state.info["k_goal"], hpair)
+                                       state.info["k_goal"], hpair, contact)
         dist = jnp.linalg.norm(achieved - goal)
         success = (dist < self.goal_reach_thresh).astype(jnp.float32)
         slow = jnp.linalg.norm(data.qvel) < 1.0
@@ -1199,7 +1430,9 @@ class Brachiation(Env):
         # TrajectoryIdWrapper and brax's EpisodeWrapper add keys (traj_id, steps,
         # truncation, episode metrics) and a changed pytree structure breaks the
         # lax.scan inside EpisodeWrapper.
-        cov_m, cov_i = self._coverage(data, state.info, hold_dual, h_park)
+        cov_m, cov_i = self._coverage(data, state.info, hold_dual, h_park,
+                                      contact_now=contact_now, near_goal=near_goal,
+                                      load=load)
         metrics.update(cov_m)
 
         info = dict(state.info)
@@ -1210,6 +1443,10 @@ class Brachiation(Env):
                     hold_streak=hold_streak, next_streak=next_streak,
                     dual_streak=dual_streak, park_streak=park_streak,
                     hpair_streak=hpair_streak,
+                    contact_streak=contact_streak, contact_ema=load,
+                    # the resolved `hold` value this step used (variant-dependent
+                    # source, so record it rather than re-derive it on read)
+                    hold_feature=hold,
                     k_ref=k_ref, k_ref_run=k_run, k_ref_run_bar=k_run_bar,
                     kref_max=kref_max,
                     switches_total=(state.info.get("switches_total", jnp.zeros(()))
