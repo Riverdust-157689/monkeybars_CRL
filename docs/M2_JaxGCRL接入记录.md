@@ -4355,3 +4355,79 @@ cd ~/monkeyBars_CRL && unset JAX_PLATFORMS CUDA_VISIBLE_DEVICES
 `(training_state, replay_buffer_state, env_state, rng, config)`，再加 `--resume-state`；
 一份 ~1 GiB，落盘 10–30 s。**只在加了这个之后的 run 上才谈得上"接着跑"**；
 本次 6h run 没有，所以无法补。
+
+### 9.77 1 h warm start（基线 `support_dual`）：机制成立，**B1 变好、B2 变差**
+
+`runs/brach_dual2bar_warm1h/`（`--init-from runs/ckpt_dual2bar_6h/final`，9.0 M 步 / 11 evals，
+`git bd98b51`，`gpu 0`；配方与 6h 基线逐项相同，**但 eval 探针按建议改成了 `--eval-goal-bar 2`**）。
+
+> ⚠️ **判读前提**：这 11 个 eval 是在 **B2** 指令下量的，而 6h 基线的 `len 501 / fell 0 / succ 380`
+> 是在 **B1** 指令下量的 —— **两者不可比**。与基线可比的是它**在 B2 探针下的渲染**（§9.75.2 那张表）。
+
+#### 9.77.1 机制：warm start 确实生效了
+
+warm-start run 的 **eval 0（0.94 M 步）**就是 `len 57.8 / fell 1.00 / max_bar 50.4` —— 这正是 6h 基线
+**在 B2 探针下**的行为（链到 B1 → 坠落）。从零开始的策略在 0.94 M 步时是"挂在 B0 不动"（`max_bar ≈ 0`），
+所以这不是冷启。`[init]` 校验（actor 输入 155-D、alpha 0.0319 一起带过来）也过了。
+
+#### 9.77.2 B1 探针（`--goal-bar 1`）：**没有退化，反而更准**
+
+| | 6h 基线 @50 M | warm 1 h 后 |
+|---|---|---|
+| 存活 | 4/4（`-1`）| **4/4（`-1`）** |
+| goal dist | 1.538 → 0.038 | 1.538 → **0.006** |
+| position-only 8 维 | 0.605 → 0.026 | 0.605 → **0.006** |
+| soft grasp | L 0.63 / R 0.76 | L 0.63 / **R 0.82** |
+| **真实承力 `f>0.5`** | （当时无此列）| L **41%** / R **90%** 的存活步 |
+| 窗内占比 | — | L 67% / R 94% |
+| 手指载荷 EMA | — | L 17.1 / R **63.6** N·m |
+| 换手次数 | 12/12/13/17 | 15/19/12/19 |
+
+⇒ **B1 基本被解掉了**（右手 90% 的存活步真的抓着 B1、载荷 63.6 N·m、末端距离 0.006）。
+**但注意 L 的 `hover` 是 20%**：左手有 20% 的存活步"在 B1 窗内但不承力"——这正是
+`support_dual_load_both` 的 `h_both_load` 会判 0 的那个状态（§9.75.3），也是 bar-agnostic 距离判据的遗留漏洞。
+
+#### 9.77.3 B2 探针（`--goal-bar 2`）：**变差了**
+
+| | 6h 基线 @50 M | warm 1 h 后 |
+|---|---|---|
+| 坠落 | 4/4 @ t = 57/60/61/58 | 4/4 @ t = **62 / 27 / 27 / 68** |
+| 到 B2 最近距离 | L **0.001–0.028**（4/4 都到）| L 0.016 / **0.523** / **0.525** / 0.003（**只有 2/4 到**）|
+| B2 窗内（L）| 25–33% | **0–21%** |
+| B2 真承力（L）| 0–15% | **0–4%** |
+| B2 悬停（L）| 0–9 步 | 0–3 步 |
+| 载荷去向 | L 31.8 / R 45.9 N·m（都在**身后**的杆上）| L 37.6 / R 37.7 N·m（同）|
+
+⇒ 1 h warm start **没有解决 B2，反而让"链到 B1 就守住"这个解更占优**：两个 episode 现在在 t=27 就坠落，
+左手的座连 B2 的 5 cm 都进不去（0.52 m）。这与"B1 变得更漂亮"是同一件事的两面。
+
+**机制解释（假设）**：课程里 25% 是 B0→B1（"守住 B1"就完全解掉）、25% 是 B1→B2（同样以守 B1 为前提），
+而 B2 从来没有成功过一次 ⇒ 梯度把权重全推给了"到 B1、抓住、守住"这个**可达且被奖励**的解，
+B2 的尝试被剪掉。这与 §9.73/#21 的后期回退是同一类"吸引子塌缩"。
+
+#### 9.77.4 结论与下一步
+
+* **"再跑久一点"不是瓶颈**：与 §9.75.1 的 checkpoint 扫描一致（16→50 M 步到达变好、守住没变）。
+  本次 warm start 又给了一次独立证据：B1 继续变好，B2 继续不动/变差。
+* **warm start 这条工具是好用的**（机制已验证、B1 无损），所以下一步应当**用它去改课程，而不是延长同一课程**：
+  最便宜的 1 h 实验是把课程里的 B0→B1 那一档去掉、只留"必须以 B2 为目标"的两种 episode：
+
+```bash
+.venv-warp/bin/python -u src/train.py --preset C_l2_infonce \
+  --goal-variant support_dual --goal-reach-thresh 0.35 \
+  --train-goal-bar -1 --train-goal-bar-min 2 --train-goal-bar-max 2 --start-bar-max 1 \
+  --eval-goal-bar 2 --scene full035 \
+  --num-envs 128 --num-eval-envs 16 --episode-length 501 --batch-size 512 \
+  --steps 9000000 --num-evals 11 --expl-hold 10 --save-every 2 \
+  --buffer-gb 1.0 --xla-mem-fraction 0.6 --gpu 0 \
+  --init-from runs/ckpt_dual2bar_warm1h/final \
+  --exp-name brach_dual2bar_b2only1h --checkpoint-dir runs/ckpt_dual2bar_b2only1h \
+  --wandb --wandb-group .
+```
+
+（`gmin=gmax=2` + `start_bar_max=1` 的采样表恰好给出 **(B1→B2) 50% / (B0→B2) 50%**，没有 B0→B1；
+观测布局不变（155），所以**可以继续 warm start**。目标看 `advance_max` 是否逼近 2、
+B2 的 `f>0.5` 占比是否从 0–15% 抬起来、坠落时间是否超过 68 步。）
+
+* 另一条路是 `support_dual_load_both`（§9.75.3）：它针对的正是上面观测到的两个漏洞
+  （B2 窗内不承力、B1 上左手 20% 悬停），但它的 obs 是 **161** 维、**不能 warm start**，需冷启 6h。
